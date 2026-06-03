@@ -2050,6 +2050,15 @@ static void RunFrameLoop(XrInstance xrInstance,
         }
         std::fprintf(stderr, "[BetterVR-Linux] ImGui: dpool=%p\n", (void*)imguiPool);
 
+        // Compile-time layout check matches header (sizeof=2976 offsetof
+        // Fonts=48) but the runtime io.Fonts comes back as garbage
+        // (0x3e8ccccd40c00000 = packed floats 0.275f + 6.0f). Suggests
+        // imgui::imgui static-lib was compiled from a different imgui
+        // version than the header we include, OR memory is being trampled
+        // by ImGui::CreateContext under our specific setup. Punting on
+        // this for now since it blocks the whole quad-via-ImGui path.
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: sizeof(ImGuiIO)=%zu offset(Fonts)=%zu\n",
+                     sizeof(ImGuiIO), offsetof(ImGuiIO, Fonts));
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         std::fprintf(stderr, "[BetterVR-Linux] ImGui: ctx created\n");
