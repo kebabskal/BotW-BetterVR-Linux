@@ -1785,6 +1785,13 @@ static void RunFrameLoop(XrInstance xrInstance,
     XrSpace localSpace = XR_NULL_HANDLE;
     xrCreateReferenceSpace(session, &rsci, &localSpace);
 
+    // VIEW reference space — head-locked. Used for HUD quad so it stays
+    // 1m in front of the user regardless of where they turn.
+    XrReferenceSpaceCreateInfo rsciV = rsci;
+    rsciV.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    XrSpace viewSpace = XR_NULL_HANDLE;
+    xrCreateReferenceSpace(session, &rsciV, &viewSpace);
+
     // Capture the headset-side aspect ratio (per-eye) — used by the projection
     // hooks when adjusting the game's projection FOV.
     const float headsetAspect = (viewCfgs[0].recommendedImageRectHeight > 0)
@@ -2383,11 +2390,14 @@ static void RunFrameLoop(XrInstance xrInstance,
                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                                        0, nullptr, 0, nullptr, 1, &toShader);
 
-                // HUD overlay on projection layer (legacy). Re-enable via
-                // BVR_HUD=1 for the shader-discard test.
+                // Legacy in-eye HUD overlay: draws the 2D buffer over the
+                // eye projection. Broken because the gameplay 2D buffer is
+                // mostly a near-magic clear color the shader's discard tol
+                // doesn't catch, so it fills the eye with green/blue.
+                // Default OFF; opt-in with BVR_HUD=1.
                 static const bool kHudEnabled = [](){
                     const char* v = std::getenv("BVR_HUD");
-                    bool on = !(v && v[0] == '0');
+                    bool on = v && v[0] == '1';
                     std::fprintf(stderr, "[BetterVR-Linux] HUD draw enabled=%d\n", (int)on);
                     return on;
                 }();
@@ -2643,12 +2653,18 @@ static void RunFrameLoop(XrInstance xrInstance,
                 dfn.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                           hudPL, 0, 1, &hudDS[0], 0, nullptr);
                 // Present image source: don't discard (no magic colors in
-                // BotW's final composited frame). Capture-2D source: use
-                // larger tolerance to drop magic clears. Tunable via
-                // BVR_HUD_TOL env var.
+                // BotW's final composited frame). Capture-2D source: need
+                // a tolerance that catches the BGRA8-quantized magic clear
+                // values stored in the actual buffer — the pack writes
+                // (0.0625, 0.123, 0.987) but storage holds (0.0588,
+                // 0.1216, 0.9843), a delta of ~0.004 per channel. Use
+                // 0.02 default so quantization is safely covered without
+                // catching real UI pixels. Tunable via BVR_HUD_TOL.
                 static const float kTol = [](){
                     const char* v = std::getenv("BVR_HUD_TOL");
-                    return v ? (float)atof(v) : 0.0f;
+                    float t = v ? (float)atof(v) : 0.02f;
+                    std::fprintf(stderr, "[BetterVR-Linux] QuadHudTol=%.3f\n", t);
+                    return t;
                 }();
                 float pc[8] = {
                     0.0625f, 0.123f, 0.987f, kTol,
@@ -2694,7 +2710,7 @@ static void RunFrameLoop(XrInstance xrInstance,
                 // Build the quad layer pose: 1 m in front of the user, 1×0.56m
                 hudQuadLayer.type            = XR_TYPE_COMPOSITION_LAYER_QUAD;
                 hudQuadLayer.layerFlags      = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                hudQuadLayer.space           = localSpace;
+                hudQuadLayer.space           = viewSpace;
                 hudQuadLayer.eyeVisibility   = XR_EYE_VISIBILITY_BOTH;
                 hudQuadLayer.subImage.swapchain       = hudQuadSwapchain;
                 hudQuadLayer.subImage.imageRect       = { { 0, 0 }, { (int32_t)hudQuadW, (int32_t)hudQuadH } };
@@ -2824,15 +2840,25 @@ static void RunFrameLoop(XrInstance xrInstance,
         fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         const XrCompositionLayerBaseHeader* layers[2] = { nullptr, nullptr };
         uint32_t layerCount = 0;
+        static std::atomic<uint64_t> s_quadSubmitted{0};
+        static std::atomic<uint64_t> s_quadSkipped{0};
         if (fs.shouldRender) {
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer);
             if (hudQuadReady) {
                 layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hudQuadLayer);
+                s_quadSubmitted.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                s_quadSkipped.fetch_add(1, std::memory_order_relaxed);
             }
             fei.layerCount = layerCount;
             fei.layers     = layers;
         }
         xrEndFrame(session, &fei);
+        if ((frameNo % 90) == 0) {
+            std::fprintf(stderr, "[BetterVR-Linux] QuadLayer: submitted=%lu skipped=%lu\n",
+                         s_quadSubmitted.load(std::memory_order_relaxed),
+                         s_quadSkipped.load(std::memory_order_relaxed));
+        }
         ++frameNo;
         if ((frameNo % 90) == 0) {
             std::fprintf(stderr,
@@ -2871,6 +2897,7 @@ static void RunFrameLoop(XrInstance xrInstance,
     }
 
     if (localSpace != XR_NULL_HANDLE) xrDestroySpace(localSpace);
+    if (viewSpace  != XR_NULL_HANDLE) xrDestroySpace(viewSpace);
     xrDestroySwapchain(swapchain);
     std::fprintf(stderr, "[BetterVR-Linux] FrameLoop: exiting after %lu frames\n", frameNo);
 }
