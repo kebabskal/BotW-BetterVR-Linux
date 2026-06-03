@@ -1752,6 +1752,8 @@ static void RunFrameLoop(XrInstance xrInstance,
         si.width  = hudQuadW;
         si.height = hudQuadH;
         si.format = formats[0]; // same as projection — guaranteed to have alpha
+        std::fprintf(stderr, "[BetterVR-Linux] HUD quad swapchain format=%ld (VK_FORMAT_*)\n",
+                     (long)si.format);
         XrResult r = xrCreateSwapchain(session, &si, &hudQuadSwapchain);
         if (XR_FAILED(r)) {
             std::fprintf(stderr, "[BetterVR-Linux] HUD quad swapchain create failed: %d\n", (int)r);
@@ -2351,7 +2353,15 @@ static void RunFrameLoop(XrInstance xrInstance,
 
                 VkImage chosen = importedImages[slot][0][srcEye];   // 3D layer (from picked slot)
                 VkImage chosen2D = importedImages[slot][1][srcEye]; // 2D HUD layer (from picked slot)
-                if (chosen != VK_NULL_HANDLE) {
+                // Detect menu mode: no fresh complete slot this XR frame
+                // AND we haven't seen one for a while. Holding the last
+                // slot indefinitely would show the per-eye magic-clear
+                // colors as cyan/magenta tint behind the HUD quad.
+                static std::atomic<int> s_staleStreak{0};
+                if (submitSlot < 0) s_staleStreak.fetch_add(1, std::memory_order_relaxed);
+                else                s_staleStreak.store(0, std::memory_order_relaxed);
+                const bool stale = s_staleStreak.load(std::memory_order_relaxed) > 8;
+                if (chosen != VK_NULL_HANDLE && !stale) {
                     VkImageBlit blit = {};
                     blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
                     blit.srcOffsets[1]  = { srcW, srcH, 1 };
@@ -2362,17 +2372,12 @@ static void RunFrameLoop(XrInstance xrInstance,
                         chosen, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         img,    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         1, &blit, VK_FILTER_LINEAR);
-                    // 2D over-blit disabled: the 2D buffer is mostly magic-clear
-                    // (green/blue) in gameplay because there's no UI most of the
-                    // time, so a plain blit would replace the 3D scene with the
-                    // magic color. Color-keyed compositing needs a Vulkan
-                    // graphics pipeline with a fragment shader that discards
-                    // pixels matching the magic clear color. The capture is
-                    // still wired (g_eyeImages[1][eye] gets 2D content), ready
-                    // for that next step.
                     (void)chosen2D;
                 } else {
-                    VkClearColorValue color = { eye == 0 ? 0.1f : 0.6f, 0.1f, 0.1f, 1.0f };
+                    // No 3D source (or menu mode): clear to neutral black so
+                    // the projection layer doesn't bleed magic colors
+                    // through transparent HUD quad regions.
+                    VkClearColorValue color = { 0.0f, 0.0f, 0.0f, 1.0f };
                     dfn.CmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                            &color, 1, &range);
                 }
