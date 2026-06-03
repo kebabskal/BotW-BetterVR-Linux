@@ -303,6 +303,61 @@ static bool WriteGameMemory(uint32_t emuPtr, const T* src) {
     return true;
 }
 
+// BotW stores its values big-endian (PowerPC). Reading a 32-bit emu pointer
+// requires byteswapping the raw bytes to host order.
+static uint32_t ReadBEUint32(uint32_t emuPtr) {
+    uint32_t raw = 0;
+    if (!ReadGameMemory(emuPtr, &raw)) return 0;
+    return swapEndianness(raw);
+}
+
+// ── Screen-state inspection (port of game_state.cpp IsScreenOpen) ──
+// BotW maintains a singleton "ScreenManager" with an array of currently-open
+// screen pointers. The instance pointer lives at a fixed emu address; index
+// it by ScreenId * 4 to get the per-screen slot, which is non-null when that
+// screen is open. No hook required — pure memory inspection.
+//
+// Upstream's ScreenId enum (include/game_structs.h) maps PauseMenuInfo_00
+// to 0x2F. Only the ones we actually predicate on are listed here.
+enum class BvrScreenId : uint32_t {
+    PauseMenuInfo_00 = 0x2F,
+};
+static bool IsScreenOpen(BvrScreenId screen) {
+    constexpr uint32_t kScreenManagerInstancePtr = 0x1047E650;
+    uint32_t mgr = ReadBEUint32(kScreenManagerInstancePtr);
+    if (mgr == 0) return false;
+    uint32_t bools = ReadBEUint32(mgr + 0x18);
+    if (bools == 0) return false;
+    uint32_t slot = ReadBEUint32(bools + (uint32_t)screen * 4);
+    return slot != 0;
+}
+
+// Set when BotW captures the 3D framebuffer for screenshots / save thumbnails
+// / inventory previews — signalled by Hook_FixCameraSaveFilesAndInventory.
+// Sticky for a few frames so the predicate stays true across the capture pass.
+static std::atomic<uint32_t> g_captureFramesRemaining{0};
+static void SignalGameCapturing3DFrameBuffer() {
+    // 4 frames matches CemuHooks::GetFramesSinceLastCameraUpdate window
+    // upstream uses for similar "recent" predicates.
+    g_captureFramesRemaining.store(4, std::memory_order_relaxed);
+}
+static bool IsGameCapturing3DFrameBuffer() {
+    return g_captureFramesRemaining.load(std::memory_order_relaxed) > 0;
+}
+// Call once per XR frame to decay the capture flag.
+static void TickGameCaptureFlag() {
+    uint32_t v = g_captureFramesRemaining.load(std::memory_order_relaxed);
+    if (v > 0) g_captureFramesRemaining.store(v - 1, std::memory_order_relaxed);
+}
+
+// Mirror of upstream's UseMonoFrameBufferTemporarilyDuringMenusOrPictures
+// (camera.cpp:10). Gates the 3D buffer's post-capture clear — when true the
+// clear is skipped so the buffer keeps the previously rendered world frame,
+// giving in-game pause/equip/map menus a stable backdrop to draw over.
+static bool UseMonoFrameBufferTemporarilyDuringMenusOrPictures() {
+    return IsScreenOpen(BvrScreenId::PauseMenuInfo_00) || IsGameCapturing3DFrameBuffer();
+}
+
 // Env-var kill switches for incremental debugging. Read once at first use.
 //   BVR_DISABLE_PROJ_HOOK=1  → projection hooks become strict no-ops
 //                              (handy to confirm whether matrix rewrite is
@@ -635,6 +690,16 @@ static void Hook_GetRenderCamera(PPCInterpreter_t* hCPU) {
 static void Hook_InjectXRInput(PPCInterpreter_t* hCPU) {
     hCPU->instructionPointer = hCPU->sprNew.LR;
     hCPU->gpr[3] = 1;
+}
+
+// patch_Misc.asm's hook_FixCameraSaveFilesAndInventory — fires when BotW
+// is about to capture its 3D framebuffer for screenshots, save-file thumbs,
+// or inventory previews. Sets a sticky flag so our CmdClearColorImage hook
+// can skip the post-capture clear for a few frames, keeping the world image
+// in place behind the menu UI. (Port of framebuffer.cpp:48.)
+static void Hook_FixCameraSaveFilesAndInventory(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    SignalGameCapturing3DFrameBuffer();
 }
 
 // patch_ImproveGUI's hook_FixUIBlending — corrects blend mode for UI elements
@@ -1016,7 +1081,7 @@ static void RegisterHLEHooks() {
         { "hook_SetRigidBodyTransform",           &Hook_SetRigidBodyTransform },
         // Other patch_Misc.asm hooks — no tail-call address documented upstream,
         // keep as no-op for now (may still need fixing).
-        { "hook_FixCameraSaveFilesAndInventory",  &Hook_Noop },
+        { "hook_FixCameraSaveFilesAndInventory",  &Hook_FixCameraSaveFilesAndInventory },
         { "hook_FixLadder",                       &Hook_FixLadder },
         { "hook_RemoveRagdollControllerFromWorld", &Hook_Noop },
         { "hook_SetRagdollControllerScale",       &Hook_Noop },
@@ -2880,6 +2945,10 @@ static void RunFrameLoop(XrInstance xrInstance,
             fei.layers     = layers;
         }
         xrEndFrame(session, &fei);
+        // Decay the "BotW is capturing 3D framebuffer" flag once per XR
+        // frame. The hook sets it sticky to 4 frames so the menu-mode
+        // predicate stays true across an entire screenshot/inventory pass.
+        TickGameCaptureFlag();
         if ((frameNo % 90) == 0) {
             std::fprintf(stderr, "[BetterVR-Linux] QuadLayer: submitted=%lu skipped=%lu\n",
                          s_quadSubmitted.load(std::memory_order_relaxed),
@@ -3450,6 +3519,25 @@ public:
             // legitimate 3D-buffer content. Capturing on every magic clear is
             // wasteful but empirically gives the user the freshest content.
             InjectPreClearCapture(pDispatch, commandBuffer, image, imageLayout, slot, magicLayer, magicEye);
+
+            // Mirror upstream framebuffer.cpp:171-216 menu-mode behaviour
+            // for the 3D buffer: when a pause/equip/map menu is open OR
+            // BotW is taking a screenshot/save-thumb/inventory capture,
+            // skip the magic clear so the buffer keeps the last rendered
+            // world frame. The menu UI then composes over a stable
+            // backdrop instead of a magic-coloured wipe.
+            if (magicLayer == 0 /* 3D buffer */
+                && UseMonoFrameBufferTemporarilyDuringMenusOrPictures()) {
+                static std::atomic<uint64_t> s_skipped{0};
+                uint64_t n = s_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n == 1 || (n % 240) == 0) {
+                    std::fprintf(stderr,
+                        "[BetterVR-Linux] Skipped 3D-clear during menu/capture (n=%lu, pauseOpen=%d, capturing=%d)\n",
+                        n, (int)IsScreenOpen(BvrScreenId::PauseMenuInfo_00),
+                        (int)IsGameCapturing3DFrameBuffer());
+                }
+                return;
+            }
         }
         pDispatch.CmdClearColorImage(commandBuffer, image, imageLayout,
                                      pColor, rangeCount, pRanges);
