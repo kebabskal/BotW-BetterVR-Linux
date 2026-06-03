@@ -3429,17 +3429,6 @@ public:
             // legitimate 3D-buffer content. Capturing on every magic clear is
             // wasteful but empirically gives the user the freshest content.
             InjectPreClearCapture(pDispatch, commandBuffer, image, imageLayout, slot, magicLayer, magicEye);
-            // Replace the original magic-color clear with a clear-to-zero —
-            // matches upstream framebuffer.cpp:152-216 (clearFramebuffer(false)).
-            // BotW then draws UI on top of an alpha=0 background, so opaque
-            // pixels naturally end up with alpha=1 and untouched background
-            // stays alpha=0 — a clean mask for the quad shader to consume.
-            // Without this, the buffer is full of magic-colored pixels and
-            // we have to chromakey them out at shader time.
-            VkClearColorValue zeroClear = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-            pDispatch.CmdClearColorImage(commandBuffer, image, imageLayout,
-                                         &zeroClear, rangeCount, pRanges);
-            return;
         }
         pDispatch.CmdClearColorImage(commandBuffer, image, imageLayout,
                                      pColor, rangeCount, pRanges);
