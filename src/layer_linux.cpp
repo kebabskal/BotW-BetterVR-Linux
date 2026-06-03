@@ -689,6 +689,191 @@ static void Hook_PlayerIsRidingSandSeal(PPCInterpreter_t* hCPU) {
     hCPU->instructionPointer = hCPU->sprNew.LR;
 }
 
+// ── First-person camera anchoring ──
+// Without these, patch_FirstPersonMode collapses BotW's third-person
+// follow distance to 0 (camera sits at the third-person look-at point,
+// usually around Link's feet/torso, not his head). We track Link's
+// world matrix via hook_UpdateActorList and rewrite the camera's
+// finalCamMtx in hook_UpdateCameraForGameplay so the camera is anchored
+// at Link's head position + the headset's local offset.
+static std::mutex   g_playerMtxAddrMutex;
+static uint32_t     g_playerMtxAddr = 0;    // emulated-RAM address of GameROMPlayer's BEMatrix34
+static uint32_t     g_playerActorAddr = 0;  // emulated-RAM address of the actor itself
+
+// Patch_CTRL_NewActorHook's hook_UpdateActorList iterates BotW's actor
+// list. For each actor, gpr[6] = actor pointer. We read the actor's name
+// (via BaseProc.name.c_str) and if it's "GameROMPlayer", record the
+// actor's matrix address so hook_UpdateCameraForGameplay can read it.
+static void Hook_UpdateActorList(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    uint32_t actorPtr = hCPU->gpr[6];
+    if (actorPtr == 0 || g_hookState.memoryBase == 0) return;
+
+    // BaseProc.name is at offset 4 of the actor (after secondVTable).
+    // FixedSafeString40.c_str is at offset 0 of name.
+    // So actor + 4 = the BE pointer to the name string.
+    uint32_t nameCStrAddr = actorPtr + 4;
+    uint32_t namePtrBE = 0;
+    if (!ReadGameMemory(nameCStrAddr, &namePtrBE)) return;
+    uint32_t namePtr = __builtin_bswap32(namePtrBE);
+    if (namePtr == 0) return;
+
+    // Read up to 32 chars of the name from emulated RAM.
+    char name[32] = {};
+    const char* base = (const char*)g_hookState.memoryBase + namePtr;
+    for (size_t i = 0; i < sizeof(name) - 1; ++i) {
+        name[i] = base[i];
+        if (name[i] == 0) break;
+    }
+    name[sizeof(name) - 1] = 0;
+
+    if (std::strcmp(name, "GameROMPlayer") == 0) {
+        std::lock_guard<std::mutex> lk(g_playerMtxAddrMutex);
+        g_playerActorAddr = actorPtr;
+        // ActorWiiU.mtx is at offset 0x1F8 per game_structs.h. Hardcoded
+        // to avoid offsetof's non-standard-layout warning.
+        g_playerMtxAddr   = actorPtr + 0x1F8;
+    }
+}
+
+// patch_CTRL_CameraControls' updateCameraPositionAndTarget calls
+// hook_UpdateCameraForGameplay (gpr[31] = ActCamera ptr). Direct port of
+// upstream's hook_UpdateCameraForGameplay (camera.cpp:164) — first-person
+// path: replace the gameplay view with one anchored at the player's
+// position, then compose with the headset's middle pose.
+//
+// Coordinate convention: BotW + upstream use RIGHT-HANDED, Y-up, -Z
+// forward (camera looks down -Z) — same as glm's *RH functions and
+// OpenXR's local-reference space. glm::lookAtRH builds a view matrix
+// where forward = (target - pos)/|...|. inverse(view) = world matrix.
+//
+// finalPose = inverse(existingViewMtx) * headsetWorldMtx
+//   - inverse(existingViewMtx) = the gameplay camera's WORLD matrix
+//     (in first-person: player position + gameplay yaw)
+//   - headsetWorldMtx = the headset's local-space world matrix
+//   - product = camera's WORLD matrix in game coordinates
+// Then extract: pos = finalPose[3], forward = -normalize(finalPose[2]),
+// up = normalize(finalPose[1]). target = pos + forward * oldDistance.
+static std::atomic<uint64_t> g_updateCameraHits{0};
+static std::atomic<uint64_t> g_updateCameraSucceeded{0};
+static void Hook_UpdateCameraForGameplay(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    g_updateCameraHits.fetch_add(1, std::memory_order_relaxed);
+    if (g_hookState.memoryBase == 0) return;
+
+    uint32_t cameraPtr = hCPU->gpr[31];
+    static std::atomic<int> s_logN{0};
+    if (s_logN.fetch_add(1, std::memory_order_relaxed) < 5) {
+        std::fprintf(stderr, "[BetterVR-Linux] Hook_UpdateCameraForGameplay fired: cameraPtr=0x%08x playerMtxAddr=0x%08x\n",
+                     cameraPtr, g_playerMtxAddr);
+    }
+    if (cameraPtr == 0) return;
+
+    uint32_t playerMtxAddr;
+    {
+        std::lock_guard<std::mutex> lk(g_playerMtxAddrMutex);
+        playerMtxAddr = g_playerMtxAddr;
+    }
+    if (playerMtxAddr == 0) return;
+
+    // ── 1. Read BotW's current camera (pos/target/up) from finalCamMtx ──
+    LookAtMatrix finalCam = {};
+    uint32_t finalCamAddr = cameraPtr + 0x5C0;  // ActCamera.finalCamMtx offset
+    if (!ReadGameMemory(finalCamAddr, &finalCam)) return;
+
+    glm::vec3 oldCameraPosition = finalCam.pos.getLE();
+    glm::vec3 oldCameraTarget   = finalCam.target.getLE();
+    glm::vec3 oldCameraUp       = finalCam.up.getLE();
+    float oldCameraDistance = glm::distance(oldCameraPosition, oldCameraTarget);
+
+    // In first-person, remove pitch from the gameplay camera so head pitch
+    // comes ONLY from the headset (avoids double-pitching). This matches
+    // upstream's `oldCameraPosition.y = oldCameraTarget.y` line.
+    oldCameraPosition.y = oldCameraTarget.y;
+
+    // ── 2. Extract gameplay rotation from the existing view matrix ──
+    if (glm::distance(oldCameraPosition, oldCameraTarget) < 1e-4f) {
+        // Degenerate (pos == target). Bail and let BotW use its own value.
+        return;
+    }
+    glm::mat4 existingViewMtx = glm::lookAtRH(oldCameraPosition, oldCameraTarget, oldCameraUp);
+    glm::fquat gameplayRotation = glm::quat_cast(glm::inverse(existingViewMtx));
+
+    // ── 3. Read player world position ──
+    BEMatrix34 playerMtx = {};
+    if (!ReadGameMemory(playerMtxAddr, &playerMtx)) return;
+    glm::vec3 playerPos = playerMtx.getPos().getLE();
+    // BotW's world units don't map 1:1 to meters. Empirically +1.6 lands
+    // at Link's waist; head is ~+3. BVR_FP_HEAD_HEIGHT overrides the
+    // constant for tuning.
+    static const float kHeadHeight = [](){
+        const char* v = std::getenv("BVR_FP_HEAD_HEIGHT");
+        float h = v ? (float)atof(v) : 3.0f;
+        std::fprintf(stderr, "[BetterVR-Linux] FpHeadHeight=%.2f\n", h);
+        return h;
+    }();
+    playerPos.y += kHeadHeight;
+
+    // ── 4. Rebase: replace the view-matrix anchor with playerPos ──
+    glm::mat4 rebasedView = glm::inverse(
+        glm::translate(glm::mat4(1.0f), playerPos) * glm::mat4_cast(gameplayRotation));
+
+    // ── 5. Build the headset's world matrix (middle of L/R eyes) ──
+    // BVR_FP_HEAD_TRANSLATE=0 zeros the headset translation, so the
+    // camera locks directly to Link's head + 1.6m — only head ROTATION
+    // takes effect. Useful to isolate "is the height right?" from
+    // "is the lateral offset right?". Default = 1 (full pose).
+    static const bool kFpHeadTranslate = [](){
+        const char* v = std::getenv("BVR_FP_HEAD_TRANSLATE");
+        bool on = !(v && v[0] == '0');
+        std::fprintf(stderr, "[BetterVR-Linux] FpHeadTranslate=%d\n", (int)on);
+        return on;
+    }();
+    XrPosef poseL = {}, poseR = {};
+    if (!g_hookState.getPose(0, &poseL) || !g_hookState.getPose(1, &poseR)) return;
+    glm::vec3 headPos = kFpHeadTranslate
+        ? (glm::vec3(poseL.position.x, poseL.position.y, poseL.position.z)
+         + glm::vec3(poseR.position.x, poseR.position.y, poseR.position.z)) * 0.5f
+        : glm::vec3(0.0f);
+    glm::fquat headRot = glm::slerp(
+        glm::fquat(poseL.orientation.w, poseL.orientation.x, poseL.orientation.y, poseL.orientation.z),
+        glm::fquat(poseR.orientation.w, poseR.orientation.x, poseR.orientation.y, poseR.orientation.z),
+        0.5f);
+    glm::mat4 headsetWorldMtx = glm::translate(glm::mat4(1.0f), headPos) * glm::mat4_cast(headRot);
+
+    // ── 6. Compose final camera world matrix ──
+    glm::mat4 finalPose = glm::inverse(rebasedView) * headsetWorldMtx;
+
+    // ── 7. Extract pos / forward / up (right-handed: forward = -Z col) ──
+    glm::vec3 camPos  = glm::vec3(finalPose[3]);
+    glm::vec3 forward = -glm::normalize(glm::vec3(finalPose[2]));
+    glm::vec3 upDir   =  glm::normalize(glm::vec3(finalPose[1]));
+    glm::vec3 target  = camPos + forward * oldCameraDistance;
+
+    // ── 8. Write back ──
+    finalCam.pos    = camPos;
+    finalCam.target = target;
+    finalCam.up     = upDir;
+    WriteGameMemory(finalCamAddr, &finalCam);
+    g_updateCameraSucceeded.fetch_add(1, std::memory_order_relaxed);
+
+    // Periodically log what we're writing so we can compare to user's
+    // observed in-headset position.
+    static std::atomic<int> s_n{0};
+    int n = s_n.fetch_add(1, std::memory_order_relaxed);
+    if (n < 5 || (n % 600) == 0) {
+        std::fprintf(stderr,
+            "[BetterVR-Linux] CamWrite#%d: player=(%.2f,%.2f,%.2f) head=(%.2f,%.2f,%.2f) "
+            "oldDist=%.3f camPos=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f)\n",
+            n,
+            playerPos.x, playerPos.y, playerPos.z,
+            headPos.x, headPos.y, headPos.z,
+            oldCameraDistance,
+            camPos.x, camPos.y, camPos.z,
+            target.x, target.y, target.z);
+    }
+}
+
 // patch_CTRL_FixScreenChecks's hook_FixExtraStaminaGaugeIconPositions —
 // the original instruction at the patch site was `fpr[29] = 1.0f`, so we
 // preserve that side-effect. In first-person upstream jumps to 0x02FB29C4
@@ -723,7 +908,7 @@ static void RegisterHLEHooks() {
         // be registered.
         { "hook_OverwriteSeadPerspectiveProjectionSet", &Hook_Noop },
         { "hook_GetRenderCamera",                 &Hook_GetRenderCamera },
-        { "hook_UpdateCameraForGameplay",         &Hook_Noop },
+        { "hook_UpdateCameraForGameplay",         &Hook_UpdateCameraForGameplay },
         { "hook_AdjustGameplayCameraPivot",       &Hook_Noop },
         { "hook_CheckIfCameraCanSeePos",          &Hook_CheckIfCameraCanSeePos },
         { "hook_RouteActorJob",                   &Hook_Noop },
@@ -755,7 +940,7 @@ static void RegisterHLEHooks() {
         { "hook_ModifyHandModelAccessSearch",     &Hook_Noop },
         // patch_CTRL_NewActorHook.asm
         { "hook_CreateNewActor",                  &Hook_Noop },
-        { "hook_UpdateActorList",                 &Hook_Noop },
+        { "hook_UpdateActorList",                 &Hook_UpdateActorList },
         // patch_CTRL_Rumble.asm
         { "hook_XRRumble",                        &Hook_Noop },
         { "hook_XRRumble_VPADControlMotor",       &Hook_XRRumble_VPADControlMotor },
@@ -2078,6 +2263,11 @@ static void RunFrameLoop(XrInstance xrInstance,
                 g_hookState.hitsLightPrePass.load(std::memory_order_relaxed),
                 g_currentEye.load(std::memory_order_relaxed),
                 g_activeSwapImageIndex.load(std::memory_order_relaxed));
+            std::fprintf(stderr,
+                "[BetterVR-Linux] UpdateCam: hits=%lu ok=%lu | playerMtxAddr=0x%08x\n",
+                g_updateCameraHits.load(std::memory_order_relaxed),
+                g_updateCameraSucceeded.load(std::memory_order_relaxed),
+                g_playerMtxAddr);
             std::fprintf(stderr,
                 "[BetterVR-Linux] Slots: capL[s0=%lu s1=%lu] capR[s0=%lu s1=%lu] cap2D[s0=%lu s1=%lu] picks[s0=%lu s1=%lu none=%lu]\n",
                 g_capturePerSlotEye[0][0].load(std::memory_order_relaxed),
