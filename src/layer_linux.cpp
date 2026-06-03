@@ -2015,7 +2015,13 @@ static void RunFrameLoop(XrInstance xrInstance,
     // captured from BotW's framebuffers.
     bool imguiReady = false;
     VkDescriptorPool imguiPool = VK_NULL_HANDLE;
+    // BVR_IMGUI=1 to enable; otherwise skipped (the ImGui-Vulkan font
+    // texture creation currently SIGSEGVs at +0x228 in vkAllocateCommandBuffers
+    // — needs deeper investigation of the loader's device-level function
+    // resolution against our XR-side VkInstance).
+    const bool kEnableImgui = std::getenv("BVR_IMGUI") && std::getenv("BVR_IMGUI")[0] == '1';
     do {
+        if (!kEnableImgui) { std::fprintf(stderr, "[BetterVR-Linux] ImGui: disabled (set BVR_IMGUI=1 to enable)\n"); break; }
         std::fprintf(stderr, "[BetterVR-Linux] ImGui: init start (inst=%p physDev=%p)\n",
                      (void*)g_ourVkInstance, (void*)g_xrPhysDev);
         if (!hudQuadSwapchain) { std::fprintf(stderr, "[BetterVR-Linux] ImGui: no HUD swapchain\n"); break; }
@@ -2050,21 +2056,26 @@ static void RunFrameLoop(XrInstance xrInstance,
         // Loader: ImGui needs Vulkan funcs we haven't resolved. Use the
         // global vkGetInstanceProcAddr (works for instance + device funcs
         // via the vkroots dispatch chain).
+        // Pack device into a static so the loader closure can reach it.
+        static VkDevice s_imguiDev = device;
+        s_imguiDev = device;
         static std::atomic<int> s_missingCount{0};
         bool loadOk = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3,
             [](const char* name, void* user) -> PFN_vkVoidFunction {
                 auto* vbp = (VkBoot*)user;
                 if (!vbp || !vbp->GetInstanceProcAddr) return nullptr;
+                // 1) Try instance proc addr (returns instance and some
+                //    device-level funcs depending on the loader).
                 PFN_vkVoidFunction fn = vbp->GetInstanceProcAddr(g_ourVkInstance, name);
+                // 2) Fall back to device proc addr for device-level funcs.
+                if (!fn && vbp->GetDeviceProcAddr && s_imguiDev) {
+                    fn = (PFN_vkVoidFunction)vbp->GetDeviceProcAddr(s_imguiDev, name);
+                }
                 if (!fn) {
-                    if (s_missingCount.fetch_add(1) < 20) {
+                    if (s_missingCount.fetch_add(1) < 30) {
                         std::fprintf(stderr, "[BetterVR-Linux] ImGui loader: missing '%s' (stubbing)\n", name);
                     }
-                    // Stub: ImGui only fails LoadFunctions if any pointer is
-                    // nullptr. Surface/swapchain functions aren't used since
-                    // we drive rendering manually with dynamic rendering, so
-                    // returning a non-null stub keeps LoadFunctions happy.
-                    static auto stub = [](){ }; // address used as dummy fn ptr
+                    static auto stub = [](){ };
                     return reinterpret_cast<PFN_vkVoidFunction>(+stub);
                 }
                 return fn;
@@ -2073,11 +2084,15 @@ static void RunFrameLoop(XrInstance xrInstance,
         std::fprintf(stderr, "[BetterVR-Linux] ImGui: LoadFunctions returned %d (missing=%d)\n",
                      (int)loadOk, s_missingCount.load());
 
-        VkFormat hudColorFormat = (VkFormat)formats[0];
+        // Static so pColorAttachmentFormats stays valid after our stack
+        // frame goes away — ImGui's font texture creation (deferred from
+        // NewFrame) reads the format from its copy of PipelineRenderingCreateInfo.
+        static VkFormat s_hudColorFormat = (VkFormat)formats[0];
+        s_hudColorFormat = (VkFormat)formats[0];
         VkPipelineRenderingCreateInfoKHR prci = {};
         prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
         prci.colorAttachmentCount    = 1;
-        prci.pColorAttachmentFormats = &hudColorFormat;
+        prci.pColorAttachmentFormats = &s_hudColorFormat;
 
         ImGui_ImplVulkan_InitInfo init = {};
         init.Instance       = g_ourVkInstance;
@@ -2096,7 +2111,13 @@ static void RunFrameLoop(XrInstance xrInstance,
             break;
         }
         std::fprintf(stderr, "[BetterVR-Linux] ImGui: Init returned ok\n");
-        // CreateFontsTexture is called automatically on first NewFrame.
+        // Build the font texture upfront so we control when the GPU work
+        // happens (rather than during the first NewFrame from the busy XR
+        // FrameLoop where command buffers might already be in flight).
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: calling CreateFontsTexture\n");
+        bool fontsOk = ImGui_ImplVulkan_CreateFontsTexture();
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: CreateFontsTexture returned %d\n", (int)fontsOk);
+        if (!fontsOk) break;
         // ImGui needs display size set. We use the HUD quad swapchain size.
         io.DisplaySize = ImVec2((float)hudQuadW, (float)hudQuadH);
         io.DeltaTime = 1.0f / 60.0f;
