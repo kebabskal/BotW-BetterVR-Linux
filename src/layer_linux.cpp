@@ -80,6 +80,12 @@ static CapturedHandles g_handles;
 // All are exported VkImages on Cemu's VkDevice with OPAQUE_FD memory; the
 // OpenXR side imports each fd.
 static SharedImage     g_eyeImages[2][2][2];
+// Cemu's final presented frame (after BotW's full rendering pipeline:
+// stereo 3D + HUD/menu compositing). Captured at vkQueuePresentKHR BEFORE
+// our BlitCapturedToCemuWindow overrides the swapchain content. Used as
+// the source for the HUD quad layer so the user sees BotW's actual HUD
+// floating in front of them (regardless of where BotW renders it).
+static SharedImage     g_cemuPresentImage;
 static CemuSwapchain   g_cemuSwap;
 static std::mutex      g_handlesMutex;
 static std::atomic_bool g_xrSessionAttempted{false};
@@ -1226,7 +1232,103 @@ static void SetupSharedImageForEye(int slot, int layer, int eye,
                  slot, layer, eye, target.width, target.height, fd, (size_t)req.size, (void*)image);
 }
 
-// Convenience: set up all 8 eye images (2 slots × 2 layers × 2 eyes).
+// Convenience: set up all 8 eye images (2 slots × 2 layers × 2 eyes)
+// plus the Cemu-present image used as the HUD quad source.
+static void SetupCemuPresentImage(VkInstance instance, VkPhysicalDevice physDev,
+                                  VkDevice device, uint32_t queueFamily,
+                                  const VkBoot& vb)
+{
+    std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: start (device=%p)\n", (void*)device);
+    const vkroots::VkDeviceDispatch* dd = vkroots::tables::DeviceDispatches.find(device);
+    const vkroots::VkInstanceDispatch* id = vkroots::tables::InstanceDispatches.find(instance);
+    if (!dd || !id) {
+        std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: dispatch missing\n");
+        return;
+    }
+    SharedImage& target = g_cemuPresentImage;
+
+    VkExternalMemoryImageCreateInfo extImg = {};
+    extImg.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    extImg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    VkImageCreateInfo ici = {};
+    ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.pNext         = &extImg;
+    ici.imageType     = VK_IMAGE_TYPE_2D;
+    ici.format        = target.format;
+    ici.extent        = { target.width, target.height, 1 };
+    ici.mipLevels     = 1;
+    ici.arrayLayers   = 1;
+    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                      | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage image = VK_NULL_HANDLE;
+    std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: before CreateImage (dd=%p)\n",
+                 (const void*)dd);
+    if (dd->CreateImage(device, &ici, nullptr, &image) != VK_SUCCESS) {
+        std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: CreateImage failed\n");
+        return;
+    }
+    std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: CreateImage ok image=%p\n", (void*)image);
+
+    VkMemoryRequirements req = {};
+    dd->GetImageMemoryRequirements(device, image, &req);
+    std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: req.size=%zu typeBits=%x\n",
+                 (size_t)req.size, req.memoryTypeBits);
+
+    VkPhysicalDeviceMemoryProperties memProps = {};
+    id->GetPhysicalDeviceMemoryProperties(physDev, &memProps);
+    uint32_t memTypeIdx = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memTypeIdx = i; break;
+        }
+    }
+    if (memTypeIdx == UINT32_MAX) return;
+
+    VkExportMemoryAllocateInfo exportInfo = {};
+    exportInfo.sType       = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkMemoryAllocateInfo mai = {};
+    mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext           = &exportInfo;
+    mai.allocationSize  = req.size;
+    mai.memoryTypeIndex = memTypeIdx;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult ar = dd->AllocateMemory(device, &mai, nullptr, &memory);
+    std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: AllocateMemory=%d (typeIdx=%u)\n",
+                 (int)ar, memTypeIdx);
+    if (ar != VK_SUCCESS) return;
+    VkResult br = dd->BindImageMemory(device, image, memory, 0);
+    std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: BindImageMemory=%d\n", (int)br);
+    if (br != VK_SUCCESS) return;
+
+    // Use the dispatch table's already-resolved GetMemoryFdKHR (same as
+    // SetupSharedImageForEye does) — vb.GetDeviceProcAddr can be nullptr
+    // at this point if QueuePresent runs before the FrameLoop re-resolves it.
+    int fd = -1;
+    VkMemoryGetFdInfoKHR fdInfo = {};
+    fdInfo.sType      = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    fdInfo.memory     = memory;
+    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    if (dd->GetMemoryFdKHR(device, &fdInfo, &fd) != VK_SUCCESS) {
+        std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: vkGetMemoryFdKHR failed\n");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_handlesMutex);
+        target.fd         = fd;
+        target.memorySize = req.size;
+        target.cemuImage  = image;
+    }
+    std::fprintf(stderr, "[BetterVR-Linux] CemuPresent: exported %ux%u image, fd=%d cemuImage=%p\n",
+                 target.width, target.height, fd, (void*)image);
+}
+
 static void SetupSharedImageFromCemuDevice(VkInstance instance, VkPhysicalDevice physDev,
                                            VkDevice device, uint32_t queueFamily,
                                            const VkBoot& vb)
@@ -1238,6 +1340,7 @@ static void SetupSharedImageFromCemuDevice(VkInstance instance, VkPhysicalDevice
             }
         }
     }
+    SetupCemuPresentImage(instance, physDev, device, queueFamily, vb);
 }
 
 // Device-level Vulkan functions, resolved from the OpenXR-side VkDevice.
@@ -1456,6 +1559,69 @@ static void RunFrameLoop(XrInstance xrInstance,
     // Legacy alias used by the (disabled) quad-layer path further down.
     VkImage importedImage = importedImages[0][0][0]; // slot 0, 3D, left eye
     SharedImage shared = shareds[0][0][0];
+
+    // Import g_cemuPresentImage (the captured Cemu present frame, used as
+    // the HUD quad source).
+    VkImage importedPresentImage = VK_NULL_HANDLE;
+    SharedImage presentShared = {};
+    {
+        std::lock_guard<std::mutex> lk(g_handlesMutex);
+        presentShared = g_cemuPresentImage;
+    }
+    if (presentShared.fd >= 0) {
+        VkExternalMemoryImageCreateInfo extImg = {};
+        extImg.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        extImg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkImageCreateInfo ici = {};
+        ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.pNext         = &extImg;
+        ici.imageType     = VK_IMAGE_TYPE_2D;
+        ici.format        = presentShared.format;
+        ici.extent        = { presentShared.width, presentShared.height, 1 };
+        ici.mipLevels     = 1;
+        ici.arrayLayers   = 1;
+        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                          | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage img = VK_NULL_HANDLE;
+        if (dfn.CreateImage(device, &ici, nullptr, &img) == VK_SUCCESS) {
+            VkMemoryRequirements req = {};
+            dfn.GetImageMemoryRequirements(device, img, &req);
+            uint32_t typeBits = req.memoryTypeBits;
+            if (GetMemoryFdPropertiesKHR) {
+                VkMemoryFdPropertiesKHR fdProps = {};
+                fdProps.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+                if (GetMemoryFdPropertiesKHR(device,
+                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+                        presentShared.fd, &fdProps) == VK_SUCCESS) {
+                    typeBits &= fdProps.memoryTypeBits;
+                }
+            }
+            uint32_t typeIdx = UINT32_MAX;
+            for (uint32_t i = 0; i < 32; ++i) {
+                if (typeBits & (1u << i)) { typeIdx = i; break; }
+            }
+            VkImportMemoryFdInfoKHR importFd = {};
+            importFd.sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+            importFd.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+            importFd.fd         = presentShared.fd;
+            VkMemoryAllocateInfo mai = {};
+            mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            mai.pNext           = &importFd;
+            mai.allocationSize  = presentShared.memorySize;
+            mai.memoryTypeIndex = typeIdx;
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            if (dfn.AllocateMemory(device, &mai, nullptr, &mem) == VK_SUCCESS) {
+                dfn.BindImageMemory(device, img, mem, 0);
+                importedPresentImage = img;
+                std::fprintf(stderr, "[BetterVR-Linux] FrameLoop: imported Cemu present image %ux%u\n",
+                             presentShared.width, presentShared.height);
+            }
+        }
+    }
 
     VkCommandPoolCreateInfo cpci = {};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1771,13 +1937,21 @@ static void RunFrameLoop(XrInstance xrInstance,
         // pick at draw time. The HUD draw is disabled (BVR_HUD=0) until
         // the ring-buffer 3D side is verified stable.
         for (int eye = 0; eye < 2; ++eye) {
-            VkImage src2D = importedImages[0][1][eye];
+            // Prefer the Cemu-present image (contains full BotW output incl
+            // HUD) when available; fall back to the 2D capture (often only
+            // magic clear) otherwise.
+            VkImage src2D = (importedPresentImage != VK_NULL_HANDLE)
+                          ? importedPresentImage
+                          : importedImages[0][1][eye];
+            VkFormat srcFormat = (importedPresentImage != VK_NULL_HANDLE)
+                          ? presentShared.format
+                          : shareds[0][1][eye].format;
             if (src2D == VK_NULL_HANDLE) continue;
             VkImageViewCreateInfo ivci = {};
             ivci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             ivci.image    = src2D;
             ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            ivci.format   = shareds[0][1][eye].format;
+            ivci.format   = srcFormat;
             ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             if (dfn.CreateImageView(device, &ivci, nullptr, &hudSrcView[eye]) != VK_SUCCESS) {
                 hudSrcView[eye] = VK_NULL_HANDLE;
@@ -2216,9 +2390,12 @@ static void RunFrameLoop(XrInstance xrInstance,
         // after the projection layer — runtime alpha-blends it on top.
         XrCompositionLayerQuad hudQuadLayer = {};
         bool hudQuadReady = false;
+        VkImage hudSampledImage = (importedPresentImage != VK_NULL_HANDLE)
+                                ? importedPresentImage
+                                : importedImages[0][1][0];
         if (fs.shouldRender && hudQuadSwapchain != XR_NULL_HANDLE
             && hudReady && hudDS[0] != VK_NULL_HANDLE
-            && importedImages[0][1][0] != VK_NULL_HANDLE) {
+            && hudSampledImage != VK_NULL_HANDLE) {
             uint32_t imgIdx = 0;
             XrSwapchainImageAcquireInfo sai = {}; sai.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
             xrAcquireSwapchainImage(hudQuadSwapchain, &sai, &imgIdx);
@@ -2259,7 +2436,7 @@ static void RunFrameLoop(XrInstance xrInstance,
                 toGen.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
                 toGen.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 toGen.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                toGen.image         = importedImages[0][1][0];
+                toGen.image         = hudSampledImage;
                 toGen.subresourceRange = range;
                 dfn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
@@ -2287,8 +2464,16 @@ static void RunFrameLoop(XrInstance xrInstance,
                 dfn.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hudPipeline);
                 dfn.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                           hudPL, 0, 1, &hudDS[0], 0, nullptr);
+                // Present image source: don't discard (no magic colors in
+                // BotW's final composited frame). Capture-2D source: use
+                // larger tolerance to drop magic clears. Tunable via
+                // BVR_HUD_TOL env var.
+                static const float kTol = [](){
+                    const char* v = std::getenv("BVR_HUD_TOL");
+                    return v ? (float)atof(v) : 0.0f;
+                }();
                 float pc[8] = {
-                    0.0625f, 0.123f, 0.987f, 0.1f,
+                    0.0625f, 0.123f, 0.987f, kTol,
                     0.0625f, 0.987f, 0.123f, 0.0f,
                 };
                 dfn.CmdPushConstants(cmd, hudPL, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -2842,6 +3027,10 @@ public:
         // captured swapchain images, blit it into the shared image so the
         // OpenXR side picks it up next frame.
         CopyPresentToSharedIfReady(presentInfo);
+        // Capture Cemu's actual presented frame BEFORE we override it.
+        // This frame contains BotW's full output including HUD/menus,
+        // which we feed into the HUD quad layer.
+        CaptureCemuPresentForHud(presentInfo);
         // Reverse path: blit our captured 3D content INTO the present image
         // so the Cemu window shows the same thing the headset shows. Useful
         // for iterating on capture/HUD work without putting on the headset.
@@ -3318,6 +3507,7 @@ public:
 private:
     static void CopyPresentToSharedIfReady(const VkPresentInfoKHR* presentInfo);
     static void BlitCapturedToCemuWindow(const VkPresentInfoKHR* presentInfo);
+    static void CaptureCemuPresentForHud(const VkPresentInfoKHR* presentInfo);
     static void InjectPerEyeCopy(const vkroots::VkCommandBufferDispatch& dd, VkCommandBuffer cb, int eye);
     static void InjectPreClearCapture(const vkroots::VkCommandBufferDispatch& dd,
                                       VkCommandBuffer cb, VkImage src,
@@ -3681,6 +3871,122 @@ void VkDeviceOverrides::BlitCapturedToCemuWindow(const VkPresentInfoKHR* present
     pc.dd->CmdPipelineBarrier(pc.cmd,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
         0, nullptr, 0, nullptr, 1, &b2);
+
+    pc.dd->EndCommandBuffer(pc.cmd);
+    VkSubmitInfo si = {};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &pc.cmd;
+    pc.dd->QueueSubmit(pc.queue, 1, &si, VK_NULL_HANDLE);
+    pc.dd->DeviceWaitIdle(pc.device);
+}
+
+// Capture Cemu's about-to-be-presented swapchain image into our
+// g_cemuPresentImage shared image. Called BEFORE BlitCapturedToCemuWindow
+// (which overrides the swapchain with our 3D content). The XR side then
+// imports g_cemuPresentImage and uses it as the HUD quad layer source —
+// the user sees BotW's actual HUD floating in front of them.
+// BVR_HUD_FROM_PRESENT=0 disables this capture.
+void VkDeviceOverrides::CaptureCemuPresentForHud(const VkPresentInfoKHR* presentInfo) {
+    static const bool kEnabled = [](){
+        const char* v = std::getenv("BVR_HUD_FROM_PRESENT");
+        bool on = !(v && v[0] == '0');
+        std::fprintf(stderr, "[BetterVR-Linux] HudFromPresent=%d\n", (int)on);
+        return on;
+    }();
+    if (!kEnabled || !presentInfo || presentInfo->swapchainCount == 0) return;
+
+    CemuSwapchain swap;
+    SharedImage   dst;
+    CapturedHandles h;
+    {
+        std::lock_guard<std::mutex> lock(g_handlesMutex);
+        swap = g_cemuSwap;
+        dst  = g_cemuPresentImage;
+        h    = g_handles;
+    }
+    if (dst.cemuImage == VK_NULL_HANDLE) return;
+    if (swap.handle == VK_NULL_HANDLE || swap.images.empty()) return;
+    if (presentInfo->pSwapchains[0] != swap.handle) return;
+    const uint32_t imgIdx = presentInfo->pImageIndices[0];
+    if (imgIdx >= swap.images.size()) return;
+    VkImage srcImage = swap.images[imgIdx];
+
+    thread_local PresentCopyResources pc;
+    if (!pc.ok) {
+        pc.dd     = vkroots::tables::DeviceDispatches.find(h.device);
+        pc.device = h.device;
+        if (!pc.dd) return;
+        pc.dd->GetDeviceQueue(h.device, h.graphicsQueueFamily, 0, &pc.queue);
+        VkCommandPoolCreateInfo cpci = {};
+        cpci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = h.graphicsQueueFamily;
+        if (pc.dd->CreateCommandPool(h.device, &cpci, nullptr, &pc.pool) != VK_SUCCESS) return;
+        VkCommandBufferAllocateInfo cbai = {};
+        cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool        = pc.pool;
+        cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        if (pc.dd->AllocateCommandBuffers(h.device, &cbai, &pc.cmd) != VK_SUCCESS) return;
+        pc.ok = true;
+        std::fprintf(stderr, "[BetterVR-Linux] CaptureCemuPresent: cmd resources ready\n");
+    }
+
+    pc.dd->ResetCommandBuffer(pc.cmd, 0);
+    VkCommandBufferBeginInfo cbbi = {};
+    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pc.dd->BeginCommandBuffer(pc.cmd, &cbbi);
+    VkImageSubresourceRange one = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    // src: PRESENT_SRC_KHR → TRANSFER_SRC_OPTIMAL
+    VkImageMemoryBarrier b1 = {};
+    b1.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b1.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT;
+    b1.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    b1.oldLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b1.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b1.image               = srcImage;
+    b1.subresourceRange    = one;
+    // dst: TRANSFER_SRC_OPTIMAL (current) → TRANSFER_DST_OPTIMAL
+    VkImageMemoryBarrier b2 = {};
+    b2.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b2.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    b2.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b2.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+    b2.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b2.image               = dst.cemuImage;
+    b2.subresourceRange    = one;
+    VkImageMemoryBarrier pre[] = { b1, b2 };
+    pc.dd->CmdPipelineBarrier(pc.cmd,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        0, nullptr, 0, nullptr, 2, pre);
+
+    VkImageBlit blit = {};
+    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.srcOffsets[1]  = { (int32_t)swap.width, (int32_t)swap.height, 1 };
+    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.dstOffsets[1]  = { (int32_t)dst.width, (int32_t)dst.height, 1 };
+    pc.dd->CmdBlitImage(pc.cmd,
+        srcImage,      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        dst.cemuImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit, VK_FILTER_LINEAR);
+
+    // Restore swap to PRESENT_SRC_KHR for the subsequent BlitCapturedToCemuWindow
+    // (which transitions to TRANSFER_DST again).
+    VkImageMemoryBarrier post = b1;
+    post.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    post.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    post.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    post.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    pc.dd->CmdPipelineBarrier(pc.cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+        0, nullptr, 0, nullptr, 1, &post);
 
     pc.dd->EndCommandBuffer(pc.cmd);
     VkSubmitInfo si = {};
