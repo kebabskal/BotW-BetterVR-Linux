@@ -1940,13 +1940,24 @@ static void RunFrameLoop(XrInstance xrInstance,
         // present image; =0 routes to the 2D-buffer capture.
         const bool kUsePresent = !(std::getenv("BVR_HUD_FROM_PRESENT") &&
                                    std::getenv("BVR_HUD_FROM_PRESENT")[0] == '0');
+        // BVR_HUD_EYE selects which eye's 2D capture feeds the HUD descriptor
+        // (only relevant when NOT using the present image). Default 1 because
+        // upstream captures on side==LEFT (after its color classification),
+        // and our INVERTED-eye routing puts that capture in eye-index 1.
+        static const int kHudEye = [](){
+            const char* v = std::getenv("BVR_HUD_EYE");
+            int e = v ? atoi(v) : 1;
+            if (e < 0 || e > 1) e = 1;
+            std::fprintf(stderr, "[BetterVR-Linux] HudEye=%d\n", e);
+            return e;
+        }();
         for (int eye = 0; eye < 2; ++eye) {
             VkImage src2D = (kUsePresent && importedPresentImage != VK_NULL_HANDLE)
                           ? importedPresentImage
-                          : importedImages[0][1][eye];
+                          : importedImages[0][1][kHudEye];
             VkFormat srcFormat = (kUsePresent && importedPresentImage != VK_NULL_HANDLE)
                           ? presentShared.format
-                          : shareds[0][1][eye].format;
+                          : shareds[0][1][kHudEye].format;
             if (src2D == VK_NULL_HANDLE) continue;
             VkImageViewCreateInfo ivci = {};
             ivci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -2393,9 +2404,15 @@ static void RunFrameLoop(XrInstance xrInstance,
         bool hudQuadReady = false;
         static const bool kHudUsePresent = !(std::getenv("BVR_HUD_FROM_PRESENT") &&
                                              std::getenv("BVR_HUD_FROM_PRESENT")[0] == '0');
+        static const int kHudSampleEye = [](){
+            const char* v = std::getenv("BVR_HUD_EYE");
+            int e = v ? atoi(v) : 1;
+            if (e < 0 || e > 1) e = 1;
+            return e;
+        }();
         VkImage hudSampledImage = (kHudUsePresent && importedPresentImage != VK_NULL_HANDLE)
                                 ? importedPresentImage
-                                : importedImages[0][1][0];
+                                : importedImages[0][1][kHudSampleEye];
         if (fs.shouldRender && hudQuadSwapchain != XR_NULL_HANDLE
             && hudReady && hudDS[0] != VK_NULL_HANDLE
             && hudSampledImage != VK_NULL_HANDLE) {
@@ -3356,6 +3373,39 @@ public:
             }
         }
     }
+    // Diagnostic: log every unique image used as a render-pass attachment
+    // with its dimensions and format, so we can spot BotW's in-game HUD
+    // buffer. Gated by BVR_LOG_RTARGETS=1.
+    static void LogRenderTargets(VkFramebuffer fb) {
+        static const bool kEnabled = [](){
+            const char* v = std::getenv("BVR_LOG_RTARGETS");
+            bool on = v && v[0] && v[0] != '0';
+            std::fprintf(stderr, "[BetterVR-Linux] LogRTargets=%d\n", (int)on);
+            return on;
+        }();
+        if (!kEnabled || fb == VK_NULL_HANDLE) return;
+        static std::unordered_set<VkImage> s_seen;
+        static std::mutex s_mtx;
+        std::vector<VkImage> imgs;
+        {
+            std::lock_guard<std::mutex> lk(g_framebufferImagesMutex);
+            auto it = g_framebufferImages.find(fb);
+            if (it != g_framebufferImages.end()) imgs = it->second;
+        }
+        for (VkImage img : imgs) {
+            std::lock_guard<std::mutex> lk(s_mtx);
+            if (s_seen.insert(img).second) {
+                ImageExtent2D ext = {};
+                {
+                    std::lock_guard<std::mutex> lk2(g_imageExtentMutex);
+                    auto it = g_imageExtent.find(img);
+                    if (it != g_imageExtent.end()) ext = it->second;
+                }
+                std::fprintf(stderr, "[BetterVR-Linux] NEW RTarget: img=%p %ux%u\n",
+                             (void*)img, ext.w, ext.h);
+            }
+        }
+    }
     static void CmdBeginRenderPass(
         const vkroots::VkCommandBufferDispatch& pDispatch,
         VkCommandBuffer                         commandBuffer,
@@ -3366,6 +3416,7 @@ public:
         if (pRenderPassBegin) {
             MarkCmdbufIfFbTargetsSwap(commandBuffer, pRenderPassBegin->framebuffer);
             HandleBeginRenderPassClearValues(commandBuffer, pRenderPassBegin);
+            LogRenderTargets(pRenderPassBegin->framebuffer);
         }
         pDispatch.CmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
     }
