@@ -52,34 +52,9 @@ struct SharedImage {
     VkImage  cemuImage   = VK_NULL_HANDLE; // The VkImage we'll copy *into* (Cemu side)
 };
 
-// Pose-with-image atomic pairing (port of upstream's m_renderFrames[idx].views
-// snapshot). Hook_GetRenderCamera pushes the eye's head pose onto its queue
-// as BotW prepares to render that eye. The Vulkan-side capture intercept
-// (InjectPreClearCapture) pops the front of the queue — the pose at the head
-// is guaranteed to be the one BotW used for the upcoming draws of this eye,
-// because both events are sequenced through Cemu's command stream.
-//
-// The XR FrameLoop reads g_capturedPose[layer][eye] for projViews[eye].pose,
-// letting the OpenXR runtime async-timewarp the captured image from its
-// actual render-time pose to the live display-time pose. This is the same
-// trick upstream uses and is what eliminates the head-rotation jitter when
-// BotW renders at a lower rate than the headset.
-static std::mutex     g_capturedPoseMutex;
-static std::deque<XrPosef> g_renderedPoseQueue[2];   // [eye]
-static XrPosef        g_capturedPose[2][2] = {};     // [layer][eye]
-static bool           g_capturedPoseValid[2][2] = {};
-// Per-eye "image captured since last consume" flag. The FrameLoop only
-// updates the swapchain (and uses the captured pose) when BOTH eyes have
-// captured since the last consume — that matches upstream's
-// Is3DComplete()-gated submit pattern, eliminating the asymmetric
-// "one eye janks" flicker that arises when one eye gets a fresh
-// capture but the other doesn't between two XR frames.
-static bool           g_imageFresh[2] = { false, false };
-// Last consumed (pose pair). Re-used when the next bothFresh consume
-// hasn't happened yet — the runtime will keep showing the last released
-// swapchain images alongside this pose pair.
-static XrPosef        g_lastConsumedPose[2] = {};
-static bool           g_lastConsumedPoseValid[2] = { false, false };
+// (Per-slot pose snapshots live in g_slotViews — see the ring-buffer
+// section below. The old per-eye pose queue + bothFresh tracking was
+// superseded by upstream's slot-keyed views snapshot.)
 
 // Captured info about Cemu's actual swapchain — populated by our CreateSwapchainKHR
 // hook so we know which VkImage is being presented each frame.
@@ -92,17 +67,19 @@ struct CemuSwapchain {
 };
 
 static CapturedHandles g_handles;
-// Per-eye shared images. Index by [layer][eye]:
-//   layer 0 = 3D scene (post-HDR composed)
-//   layer 1 = 2D HUD/UI overlay
-// 0 = left, 1 = right.
+// Per-slot, per-layer, per-eye shared images. 2-slot ring buffer matches
+// upstream BetterVR's m_renderFrames[2] architecture:
+//   slot  0/1  = the ring-buffer slot encoded in the magic clear's alpha
+//                channel (alpha < 0.5 → slot 0, ≥ 0.5 → slot 1). BotW's
+//                PPC patch alternates this per game frame so each slot is
+//                atomically owned by either BotW (writer) or our XR
+//                FrameLoop (reader) at any moment.
+//   layer 0    = 3D scene (post-HDR composed)
+//   layer 1    = 2D HUD/UI overlay
+//   eye   0/1  = left / right
 // All are exported VkImages on Cemu's VkDevice with OPAQUE_FD memory; the
 // OpenXR side imports each fd.
-static SharedImage     g_eyeImages[2][2];
-// Legacy alias for the 3D layer — keeps existing CmdClearColorImage code path
-// minimal. New 2D path uses g_eyeImages[1][eye] explicitly.
-#define g_eye3D(eye) (g_eyeImages[0][eye])
-#define g_eye2D(eye) (g_eyeImages[1][eye])
+static SharedImage     g_eyeImages[2][2][2];
 static CemuSwapchain   g_cemuSwap;
 static std::mutex      g_handlesMutex;
 static std::atomic_bool g_xrSessionAttempted{false};
@@ -134,6 +111,12 @@ static bool                  g_renderedFovValid[2] = {};
 static XrFovf                g_renderedFov[2] = {};
 static std::atomic<uint64_t> g_injectedCopies{0};
 static std::atomic<uint64_t> g_injectedCopiesPerEye[2] = {};
+// Per-slot/per-eye capture diagnostics. Helps see whether BotW is encoding
+// the slot index in alpha correctly and how often each (slot, eye) gets
+// captured. The slot-pick log shows submitted vs fallback frames.
+static std::atomic<uint64_t> g_capturePerSlotEye[2][2] = {};   // [slot][eye] 3D
+static std::atomic<uint64_t> g_capturePerSlot2D[2]     = {};   // [slot] HUD
+static std::atomic<uint64_t> g_slotPicks[3] = {};              // [0/1/-1+2 = none]
 static std::atomic<uint64_t> g_endRenderingCount{0};
 static std::atomic<uint64_t> g_endRenderingSwapchainHits{0}; // subset that matched swapchain
 
@@ -180,6 +163,43 @@ static std::mutex g_imageDirtyMutex;
 static std::atomic<uint64_t> g_beginRenderingCount{0};      // dynamic rendering
 static std::atomic<uint64_t> g_beginRenderPassCount{0};     // legacy render pass
 
+// ── Ring-buffer slot tracking ──
+// Per-slot completion flags + views snapshot. Direct port of upstream's
+// RenderFrame.copiedColor/copied2D/views model:
+//   - g_slotCopiedColor[slot][eye]: set when InjectPreClearCapture writes
+//     the 3D layer for that eye in that slot.
+//   - g_slotCopied2D[slot]: set when InjectPreClearCapture writes the 2D
+//     (HUD) layer for that slot. We don't track per-eye for 2D — upstream
+//     uses ONE 2D capture per slot (left eye), so we do the same.
+//   - g_slotViews[slot]: pose+fov pair snapshotted on the FIRST capture for
+//     that slot since the last Reset. Both eyes' poses come from the same
+//     xrLocateViews call, guaranteeing the stereo pair is consistent.
+// The slot is determined by the magic clear's alpha channel
+// (pColor->float32[3] < 0.5f ? 0 : 1), matching upstream's encoding.
+struct XrViewPair {
+    XrView v[2];     // [0] = left, [1] = right
+};
+static std::atomic_bool g_slotCopiedColor[2][2] = {};   // [slot][eye]
+static std::atomic_bool g_slotCopied2D[2]      = {};   // [slot]
+static XrViewPair       g_slotViews[2]         = {};
+static bool             g_slotViewsValid[2]    = { false, false };
+static std::mutex       g_slotViewsMutex;
+
+static bool SlotIs3DComplete(int slot) {
+    return g_slotCopiedColor[slot][0].load(std::memory_order_acquire) &&
+           g_slotCopiedColor[slot][1].load(std::memory_order_acquire);
+}
+static bool SlotIs2DComplete(int slot) {
+    return g_slotCopied2D[slot].load(std::memory_order_acquire);
+}
+static void SlotReset(int slot) {
+    g_slotCopiedColor[slot][0].store(false, std::memory_order_release);
+    g_slotCopiedColor[slot][1].store(false, std::memory_order_release);
+    g_slotCopied2D[slot].store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> lk(g_slotViewsMutex);
+    g_slotViewsValid[slot] = false;
+}
+
 // Shared state between the OpenXR worker (publisher) and the PPC HLE hooks
 // invoked from Cemu's CPU thread (consumers). Read-modify-write on the FOV
 // fields is rare and tiny, so a single mutex is fine — far simpler than
@@ -191,17 +211,10 @@ struct BvrHookState {
     XrFovf         fov[2] = {};
     // Per-eye pose published by RunFrameLoop's xrLocateViews. Used by
     // Hook_GetRenderCamera to apply head-tracked camera offset to BotW's
-    // gameplay camera.
+    // gameplay camera, and snapshotted into g_slotViews on the first
+    // capture per ring-buffer slot for the projViews submission.
     bool           poseValid[2] = { false, false };
     XrPosef        pose[2] = {};
-    // Per-eye pose ACTUALLY used by Hook_GetRenderCamera when BotW rendered
-    // the latest frame. We feed this back as projViews[eye].pose so the
-    // OpenXR runtime knows the image's render-time pose and can reproject
-    // (async timewarp) to the live display-time pose. Without this, the
-    // runtime would believe the captured image is fresh and not reproject,
-    // causing the head-tracking lag at low game framerates.
-    bool           renderedPoseValid[2] = { false, false };
-    XrPosef        renderedPose[2] = {};
     float          aspect = 1.0f;         // headset render aspect (width/height)
     std::atomic<uint64_t> publishedFrames{0};
     // Counters — how often each hook actually fires from the PPC side. Useful
@@ -236,18 +249,6 @@ struct BvrHookState {
         std::lock_guard<std::mutex> lk(mtx);
         if (eye < 0 || eye > 1 || !poseValid[eye]) return false;
         *out = pose[eye];
-        return true;
-    }
-    void recordRenderedPose(int eye, const XrPosef& p) {
-        std::lock_guard<std::mutex> lk(mtx);
-        if (eye < 0 || eye > 1) return;
-        renderedPose[eye] = p;
-        renderedPoseValid[eye] = true;
-    }
-    bool getRenderedPose(int eye, XrPosef* out) {
-        std::lock_guard<std::mutex> lk(mtx);
-        if (eye < 0 || eye > 1 || !renderedPoseValid[eye]) return false;
-        *out = renderedPose[eye];
         return true;
     }
 };
@@ -551,21 +552,6 @@ static std::pair<glm::vec3, glm::fquat> ComputeVrCameraPose(
     if (!g_hookState.getPose(eye, &xrPose)) {
         return { gameplayPos, gameplayRot };
     }
-    // Push the head pose we're about to render this eye with onto the per-eye
-    // queue. InjectPreClearCapture pops the front when it captures this eye's
-    // framebuffer — that pairs the captured image with the pose BotW used to
-    // render it. The XR FrameLoop uses the resulting per-eye pose for
-    // projViews[eye].pose so the runtime can async-timewarp the captured
-    // image to match the live head pose at display time.
-    {
-        std::lock_guard<std::mutex> lk(g_capturedPoseMutex);
-        g_renderedPoseQueue[eye].push_back(xrPose);
-        // Cap so a missed capture (e.g., a non-rendering BotW frame) can't
-        // grow the queue unboundedly. The OLDEST entry is dropped — captures
-        // get the most recent unconsumed pose.
-        while (g_renderedPoseQueue[eye].size() > 8) g_renderedPoseQueue[eye].pop_front();
-    }
-    g_hookState.recordRenderedPose(eye, xrPose);
     glm::vec3  eyePos(xrPose.position.x, xrPose.position.y, xrPose.position.z);
     glm::fquat eyeRot(xrPose.orientation.w, xrPose.orientation.x,
                       xrPose.orientation.y, xrPose.orientation.z);
@@ -629,6 +615,89 @@ static void Hook_InjectXRInput(PPCInterpreter_t* hCPU) {
     hCPU->gpr[3] = 1;
 }
 
+// patch_ImproveGUI's hook_FixUIBlending — corrects blend mode for UI elements
+// (minimap, dialogue boxes) that would otherwise overwrite the 2D HUD's alpha
+// channel. Pure: reads/writes gpr only, no game memory or external state.
+// (Direct port of upstream's hook_FixUIBlending in settings.cpp.)
+static void Hook_FixUIBlending(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    enum { BF_ZERO = 0x00, BF_SRC_ALPHA = 0x04, BF_ONE_MINUS_SRC_ALPHA = 0x05,
+           BF_DST_ALPHA = 0x06, BF_DST_COLOR = 0x08 };
+    enum { CF_DST_PLUS_SRC = 0 };
+    uint32_t colorSrc = hCPU->gpr[4], colorDst = hCPU->gpr[5], colorComb = hCPU->gpr[6];
+    uint32_t alphaSrc = hCPU->gpr[8], alphaDst = hCPU->gpr[9], alphaComb = hCPU->gpr[10];
+    bool matchesColor = colorSrc == BF_DST_COLOR && colorDst == BF_SRC_ALPHA && colorComb == CF_DST_PLUS_SRC;
+    bool matchesAlpha = alphaSrc == BF_SRC_ALPHA && alphaDst == BF_ONE_MINUS_SRC_ALPHA && alphaComb == CF_DST_PLUS_SRC;
+    if (matchesColor && matchesAlpha) {
+        hCPU->gpr[7] = 1;                          // enable separate alpha
+        hCPU->gpr[8] = BF_ZERO;                    // alphaSrc
+        hCPU->gpr[9] = BF_DST_ALPHA;               // alphaDst
+    }
+}
+
+// patch_FixVisibilityChecks's hook_CheckIfCameraCanSeePos — frustum-cull
+// query used by BotW to skip work for off-screen actors. Upstream computes
+// per-eye frustums and OR's the result. We don't have the gameplay-camera-
+// pose plumbing yet (would need ResolveGameplayBasePose + BuildGameplayCameraPose
+// from camera.cpp), so we return "always visible" (gpr[3] = 1). Safe: at
+// worst, BotW does extra work; never causes a crash or visual bug.
+static void Hook_CheckIfCameraCanSeePos(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    hCPU->gpr[3] = 1;
+}
+
+// patch_FirstPersonMode_Events's hook_ShouldSkipEventCamera — overrides
+// BotW's event camera rotation when in first-person mode + event-specific
+// settings say to ignore camera rotation. Without IsFirstPerson() state +
+// per-event settings, default to "don't skip" (gpr[3] = 0) — BotW
+// behaves normally.
+static void Hook_ShouldSkipEventCamera(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    hCPU->gpr[3] = 0;
+}
+
+// patch_FirstPersonMode_Events's hook_GetEventName — upstream uses this to
+// look up per-event settings (first-person on/off, camera rotation behaviour).
+// We don't have the event-settings table ported; return without side-effects.
+static void Hook_GetEventName(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+}
+
+// patch_CTRL_Rumble's haptic-routing hooks. Upstream forwards the call to a
+// VR rumble manager. We don't have XR controllers wired yet, so the
+// minimum-viable port is just "return to LR" — Cemu's regular VPADControlMotor
+// is replaced with nothing, so no rumble fires. Game doesn't depend on this
+// for state, only feedback.
+static void Hook_XRRumble_VPADControlMotor(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+}
+static void Hook_XRRumble_VPADStopMotor(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+}
+
+// patch_CTRL_CameraControls / patch_Misc's small state-observers. These
+// upstream observers fire on BotW state transitions (ladder, riding, etc.)
+// and update VRManager state. Without VRManager we just consume the call.
+static void Hook_FixLadder(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    hCPU->gpr[3] = 4; // safe default — allows BotW's ladder logic to continue
+}
+static void Hook_PlayerIsRiding(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+}
+static void Hook_PlayerIsRidingSandSeal(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+}
+
+// patch_CTRL_FixScreenChecks's hook_FixExtraStaminaGaugeIconPositions —
+// the original instruction at the patch site was `fpr[29] = 1.0f`, so we
+// preserve that side-effect. In first-person upstream jumps to 0x02FB29C4
+// to skip VR-incompatible code; without IsFirstPerson() we just return.
+static void Hook_FixExtraStaminaGaugeIconPositions(PPCInterpreter_t* hCPU) {
+    hCPU->instructionPointer = hCPU->sprNew.LR;
+    hCPU->fpr[29].fp0 = 1.0f;
+}
+
 static void RegisterHLEHooks() {
     auto h = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL);
     if (!h) return;
@@ -656,7 +725,7 @@ static void RegisterHLEHooks() {
         { "hook_GetRenderCamera",                 &Hook_GetRenderCamera },
         { "hook_UpdateCameraForGameplay",         &Hook_Noop },
         { "hook_AdjustGameplayCameraPivot",       &Hook_Noop },
-        { "hook_CheckIfCameraCanSeePos",          &Hook_Noop },
+        { "hook_CheckIfCameraCanSeePos",          &Hook_CheckIfCameraCanSeePos },
         { "hook_RouteActorJob",                   &Hook_Noop },
         // ----- Bulk no-op registrations for every other hook referenced by
         // the BetterVR graphic-pack patches. Without these, Cemu's HLE table
@@ -689,20 +758,22 @@ static void RegisterHLEHooks() {
         { "hook_UpdateActorList",                 &Hook_Noop },
         // patch_CTRL_Rumble.asm
         { "hook_XRRumble",                        &Hook_Noop },
+        { "hook_XRRumble_VPADControlMotor",       &Hook_XRRumble_VPADControlMotor },
+        { "hook_XRRumble_VPADStopMotor",          &Hook_XRRumble_VPADStopMotor },
         // patch_FirstPersonMode.asm
         { "hook_CalculateModelOpacity",           &Hook_Noop },
         { "hook_SetActorOpacity",                 &Hook_Noop },
         { "hook_UseCameraDistance",               &Hook_Noop },
         // patch_FirstPersonMode_Events.asm
         { "hook_ReplaceCameraMode",               &Hook_Noop },
-        { "hook_ShouldSkipEventCamera",           &Hook_Noop },
-        { "hook_GetEventName",                    &Hook_Noop },
+        { "hook_ShouldSkipEventCamera",           &Hook_ShouldSkipEventCamera },
+        { "hook_GetEventName",                    &Hook_GetEventName },
         // patch_FixVisibilityChecks.asm
-        { "hook_PlayerIsRiding",                  &Hook_Noop },
-        { "hook_PlayerIsRidingSandSeal",          &Hook_Noop },
+        { "hook_PlayerIsRiding",                  &Hook_PlayerIsRiding },
+        { "hook_PlayerIsRidingSandSeal",          &Hook_PlayerIsRidingSandSeal },
         // patch_ImproveGUI.asm
-        { "hook_FixUIBlending",                   &Hook_Noop },
-        { "hook_FixExtraStaminaGaugeIconPositions", &Hook_Noop },
+        { "hook_FixUIBlending",                   &Hook_FixUIBlending },
+        { "hook_FixExtraStaminaGaugeIconPositions", &Hook_FixExtraStaminaGaugeIconPositions },
         { "hook_FixStaminaGaugeScreenPosition",   &Hook_Noop },
         { "hook_CreateNewScreen",                 &Hook_Noop },
         // patch_Misc.asm — these are tail-call hooks (patches use `bla`, the C++
@@ -718,7 +789,7 @@ static void RegisterHLEHooks() {
         // Other patch_Misc.asm hooks — no tail-call address documented upstream,
         // keep as no-op for now (may still need fixing).
         { "hook_FixCameraSaveFilesAndInventory",  &Hook_Noop },
-        { "hook_FixLadder",                       &Hook_Noop },
+        { "hook_FixLadder",                       &Hook_FixLadder },
         { "hook_RemoveRagdollControllerFromWorld", &Hook_Noop },
         { "hook_SetRagdollControllerScale",       &Hook_Noop },
         { "hook_SetRagdollControllerTransform",   &Hook_Noop },
@@ -794,7 +865,7 @@ struct VkBoot {
 // Must be called from a worker thread AFTER vkroots has populated its
 // VkDeviceDispatch for the device (i.e. after our CreateDevice override
 // returns). We dispatch this from QueuePresentKHR's worker.
-static void SetupSharedImageForEye(int layer, int eye,
+static void SetupSharedImageForEye(int slot, int layer, int eye,
                                    VkInstance instance, VkPhysicalDevice physDev,
                                    VkDevice device, uint32_t queueFamily,
                                    const VkBoot& vb)
@@ -802,11 +873,11 @@ static void SetupSharedImageForEye(int layer, int eye,
     const vkroots::VkDeviceDispatch* dd = vkroots::tables::DeviceDispatches.find(device);
     const vkroots::VkInstanceDispatch* id = vkroots::tables::InstanceDispatches.find(instance);
     if (!dd || !id) {
-        std::fprintf(stderr, "[BetterVR-Linux] Shared[L%d/E%d]: vkroots dispatch missing (dd=%p id=%p)\n",
-                     layer, eye, (const void*)dd, (const void*)id);
+        std::fprintf(stderr, "[BetterVR-Linux] Shared[S%d/L%d/E%d]: vkroots dispatch missing (dd=%p id=%p)\n",
+                     slot, layer, eye, (const void*)dd, (const void*)id);
         return;
     }
-    SharedImage& target = g_eyeImages[layer][eye];
+    SharedImage& target = g_eyeImages[slot][layer][eye];
 
     // 1) Create the VkImage with external-memory specifier
     VkExternalMemoryImageCreateInfo extImg = {};
@@ -829,7 +900,7 @@ static void SetupSharedImageForEye(int layer, int eye,
 
     VkImage image = VK_NULL_HANDLE;
     if (dd->CreateImage(device, &ici, nullptr, &image) != VK_SUCCESS) {
-        std::fprintf(stderr, "[BetterVR-Linux] Shared[L%d/E%d]: vkCreateImage failed\n", layer, eye);
+        std::fprintf(stderr, "[BetterVR-Linux] Shared[S%d/L%d/E%d]: vkCreateImage failed\n", slot, layer, eye);
         return;
     }
 
@@ -848,7 +919,7 @@ static void SetupSharedImageForEye(int layer, int eye,
         }
     }
     if (memTypeIdx == UINT32_MAX) {
-        std::fprintf(stderr, "[BetterVR-Linux] Shared[L%d/E%d]: no compatible memory type\n", layer, eye);
+        std::fprintf(stderr, "[BetterVR-Linux] Shared[S%d/L%d/E%d]: no compatible memory type\n", slot, layer, eye);
         return;
     }
 
@@ -865,11 +936,11 @@ static void SetupSharedImageForEye(int layer, int eye,
 
     VkDeviceMemory memory = VK_NULL_HANDLE;
     if (dd->AllocateMemory(device, &mai, nullptr, &memory) != VK_SUCCESS) {
-        std::fprintf(stderr, "[BetterVR-Linux] Shared[L%d/E%d]: vkAllocateMemory failed\n", layer, eye);
+        std::fprintf(stderr, "[BetterVR-Linux] Shared[S%d/L%d/E%d]: vkAllocateMemory failed\n", slot, layer, eye);
         return;
     }
     if (dd->BindImageMemory(device, image, memory, 0) != VK_SUCCESS) {
-        std::fprintf(stderr, "[BetterVR-Linux] Shared[L%d/E%d]: vkBindImageMemory failed\n", layer, eye);
+        std::fprintf(stderr, "[BetterVR-Linux] Shared[S%d/L%d/E%d]: vkBindImageMemory failed\n", slot, layer, eye);
         return;
     }
 
@@ -952,7 +1023,7 @@ static void SetupSharedImageForEye(int layer, int eye,
     fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     int fd = -1;
     if (dd->GetMemoryFdKHR(device, &fdInfo, &fd) != VK_SUCCESS || fd < 0) {
-        std::fprintf(stderr, "[BetterVR-Linux] Shared[L%d/E%d]: vkGetMemoryFdKHR failed\n", layer, eye);
+        std::fprintf(stderr, "[BetterVR-Linux] Shared[S%d/L%d/E%d]: vkGetMemoryFdKHR failed\n", slot, layer, eye);
         return;
     }
 
@@ -962,18 +1033,20 @@ static void SetupSharedImageForEye(int layer, int eye,
         target.memorySize = req.size;
         target.cemuImage  = image;
     }
-    std::fprintf(stderr, "[BetterVR-Linux] Shared[L%d/E%d]: exported %ux%u image, fd=%d size=%zu cemuImage=%p\n",
-                 layer, eye, target.width, target.height, fd, (size_t)req.size, (void*)image);
+    std::fprintf(stderr, "[BetterVR-Linux] Shared[S%d/L%d/E%d]: exported %ux%u image, fd=%d size=%zu cemuImage=%p\n",
+                 slot, layer, eye, target.width, target.height, fd, (size_t)req.size, (void*)image);
 }
 
-// Convenience: set up all 4 eye images (3D L/R + 2D L/R).
+// Convenience: set up all 8 eye images (2 slots × 2 layers × 2 eyes).
 static void SetupSharedImageFromCemuDevice(VkInstance instance, VkPhysicalDevice physDev,
                                            VkDevice device, uint32_t queueFamily,
                                            const VkBoot& vb)
 {
-    for (int layer = 0; layer < 2; ++layer) {
-        for (int eye = 0; eye < 2; ++eye) {
-            SetupSharedImageForEye(layer, eye, instance, physDev, device, queueFamily, vb);
+    for (int slot = 0; slot < 2; ++slot) {
+        for (int layer = 0; layer < 2; ++layer) {
+            for (int eye = 0; eye < 2; ++eye) {
+                SetupSharedImageForEye(slot, layer, eye, instance, physDev, device, queueFamily, vb);
+            }
         }
     }
 }
@@ -1100,23 +1173,27 @@ static void RunFrameLoop(XrInstance xrInstance,
     VkQueue queue = VK_NULL_HANDLE;
     dfn.GetDeviceQueue(device, 0, 0, &queue);
 
-    // ---- 1.5) Import Cemu's per-eye shared images into the OpenXR-side device.
-    // shareds[layer][eye]: layer 0 = 3D scene, layer 1 = 2D HUD.
-    SharedImage shareds[2][2];
+    // ---- 1.5) Import Cemu's per-slot, per-eye shared images into the
+    // OpenXR-side device. shareds[slot][layer][eye]: 2 ring-buffer slots
+    // (the magic-clear's alpha channel selects which slot a given BotW
+    // frame's content goes into), layer 0 = 3D scene, layer 1 = 2D HUD.
+    SharedImage shareds[2][2][2];
     {
         std::lock_guard<std::mutex> lk(g_handlesMutex);
-        for (int l = 0; l < 2; ++l)
-            for (int e = 0; e < 2; ++e)
-                shareds[l][e] = g_eyeImages[l][e];
+        for (int s = 0; s < 2; ++s)
+            for (int l = 0; l < 2; ++l)
+                for (int e = 0; e < 2; ++e)
+                    shareds[s][l][e] = g_eyeImages[s][l][e];
     }
-    VkImage importedImages[2][2] = {};
+    VkImage importedImages[2][2][2] = {};
     auto GetMemoryFdPropertiesKHR = (PFN_vkGetMemoryFdPropertiesKHR)
         vb.GetDeviceProcAddr(device, "vkGetMemoryFdPropertiesKHR");
 
-    for (int slot = 0; slot < 4; ++slot) {
-        int layer = slot / 2;
-        int eye   = slot % 2;
-        const SharedImage& shared = shareds[layer][eye];
+    for (int idx = 0; idx < 8; ++idx) {
+        int slot  = idx / 4;
+        int layer = (idx / 2) % 2;
+        int eye   = idx % 2;
+        const SharedImage& shared = shareds[slot][layer][eye];
         if (shared.fd < 0) continue;
 
         VkExternalMemoryImageCreateInfo extImg = {};
@@ -1139,7 +1216,8 @@ static void RunFrameLoop(XrInstance xrInstance,
 
         VkImage img = VK_NULL_HANDLE;
         if (dfn.CreateImage(device, &ici, nullptr, &img) != VK_SUCCESS) {
-            std::fprintf(stderr, "[BetterVR-Linux] FrameLoop[%d]: import vkCreateImage failed\n", eye);
+            std::fprintf(stderr, "[BetterVR-Linux] FrameLoop[S%d/L%d/E%d]: import vkCreateImage failed\n",
+                         slot, layer, eye);
             continue;
         }
         VkMemoryRequirements req = {};
@@ -1173,18 +1251,18 @@ static void RunFrameLoop(XrInstance xrInstance,
 
         VkDeviceMemory importedMem = VK_NULL_HANDLE;
         VkResult ar = dfn.AllocateMemory(device, &mai, nullptr, &importedMem);
-        std::fprintf(stderr, "[BetterVR-Linux] FrameLoop[%d]: import vkAllocateMemory=%d (typeIdx=%u)\n",
-                     eye, (int)ar, typeIdx);
+        std::fprintf(stderr, "[BetterVR-Linux] FrameLoop[S%d/L%d/E%d]: import vkAllocateMemory=%d (typeIdx=%u)\n",
+                     slot, layer, eye, (int)ar, typeIdx);
         if (ar == VK_SUCCESS) {
             dfn.BindImageMemory(device, img, importedMem, 0);
-            importedImages[layer][eye] = img;
-            std::fprintf(stderr, "[BetterVR-Linux] FrameLoop[%d]: imported image bound\n", eye);
+            importedImages[slot][layer][eye] = img;
+            std::fprintf(stderr, "[BetterVR-Linux] FrameLoop[S%d/L%d/E%d]: imported image bound\n",
+                         slot, layer, eye);
         }
     }
-    // The existing FrameLoop body uses `importedImage`; keep it pointing at eye 0
-    // and override below per XR frame to alternate eyes.
-    VkImage importedImage = importedImages[0][0]; // 3D, left eye (legacy alias)
-    SharedImage shared = shareds[0][0];
+    // Legacy alias used by the (disabled) quad-layer path further down.
+    VkImage importedImage = importedImages[0][0][0]; // slot 0, 3D, left eye
+    SharedImage shared = shareds[0][0][0];
 
     VkCommandPoolCreateInfo cpci = {};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1449,16 +1527,18 @@ static void RunFrameLoop(XrInstance xrInstance,
         if (dfn.AllocateDescriptorSets(device, &dsai, hudDS) != VK_SUCCESS) break;
 
         // Build per-eye VkImageViews on the imported 2D images and write
-        // the descriptor sets. If an eye's 2D image hasn't been imported
-        // (no fd), we skip that eye and the HUD draw will no-op for it.
+        // the descriptor sets. Currently points at slot 0's 2D capture;
+        // proper port would create views for all (slot, eye) combos and
+        // pick at draw time. The HUD draw is disabled (BVR_HUD=0) until
+        // the ring-buffer 3D side is verified stable.
         for (int eye = 0; eye < 2; ++eye) {
-            VkImage src2D = importedImages[1][eye];
+            VkImage src2D = importedImages[0][1][eye];
             if (src2D == VK_NULL_HANDLE) continue;
             VkImageViewCreateInfo ivci = {};
             ivci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             ivci.image    = src2D;
             ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            ivci.format   = shareds[1][eye].format;
+            ivci.format   = shareds[0][1][eye].format;
             ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             if (dfn.CreateImageView(device, &ivci, nullptr, &hudSrcView[eye]) != VK_SUCCESS) {
                 hudSrcView[eye] = VK_NULL_HANDLE;
@@ -1579,22 +1659,46 @@ static void RunFrameLoop(XrInstance xrInstance,
                 std::fprintf(stderr, "[BetterVR-Linux] SwapEyes=%d\n", (int)on);
                 return on;
             }();
-            // Wait for both eyes to be captured since the last consume —
-            // matches upstream's Is3DComplete() gate. If only one eye has
-            // been refreshed between XR frames, the stereo pair would visibly
-            // desync ("one eye janks"). When !bothFresh we skip the swapchain
-            // update entirely; the runtime keeps showing the last released
-            // image for each eye, and projViews still references those
-            // swapchains (and reuses the last consumed pose pair).
-            bool bothFresh;
-            {
-                std::lock_guard<std::mutex> lk(g_capturedPoseMutex);
-                bothFresh = g_imageFresh[0] && g_imageFresh[1];
-                if (bothFresh) {
-                    g_imageFresh[0] = g_imageFresh[1] = false;
-                    if (g_capturedPoseValid[0][0]) { g_lastConsumedPose[0] = g_capturedPose[0][0]; g_lastConsumedPoseValid[0] = true; }
-                    if (g_capturedPoseValid[0][1]) { g_lastConsumedPose[1] = g_capturedPose[0][1]; g_lastConsumedPoseValid[1] = true; }
-                }
+            // ── Slot pick (port of upstream's EndFrame slot selection) ──
+            // Find a fully-complete slot to consume this XR frame.
+            // Priority:
+            //   1. Both eyes' 3D AND the 2D layer captured
+            //   2. Both eyes' 3D captured (2D missing — runtime won't show HUD)
+            //   3. 2D-only (no 3D yet, e.g., menu) — currently NOT submitted
+            //      since our 2D path isn't wired to a quad layer
+            // If no slot is fully complete, we keep showing the previously
+            // released swapchain images (no new acquire/release this frame).
+            int submitSlot = -1;
+            if (SlotIs3DComplete(0) && SlotIs2DComplete(0)) submitSlot = 0;
+            else if (SlotIs3DComplete(1) && SlotIs2DComplete(1)) submitSlot = 1;
+            else if (SlotIs3DComplete(0)) submitSlot = 0;
+            else if (SlotIs3DComplete(1)) submitSlot = 1;
+            g_slotPicks[submitSlot < 0 ? 2 : submitSlot].fetch_add(1, std::memory_order_relaxed);
+            // WiVRn requires the swapchain to be released each XR frame, so
+            // we always blit something. When no slot is complete this XR
+            // frame, re-show the LAST SUCCESSFULLY PICKED slot — BotW
+            // alternates slots per game frame, so the last-picked slot is
+            // stable (BotW is currently writing the OTHER slot). This
+            // matches upstream's behaviour of holding the last frame when
+            // no fresh frame is ready, and eliminates the "blit-stale-slot-0
+            // during mid-write" jitter.
+            static int s_lastPickedSlot = 0;
+            const int slot = (submitSlot >= 0) ? submitSlot : s_lastPickedSlot;
+            if (submitSlot >= 0) s_lastPickedSlot = submitSlot;
+            // DIAGNOSTIC: BVR_SYNC_DELAY=N sleeps for N microseconds before
+            // reading the picked slot, giving Cemu's GPU time to finish its
+            // pending capture blits. If jitter REDUCES with this delay,
+            // cross-instance GPU race is the cause — proceed with proper
+            // VK_KHR_external_semaphore_fd plumbing. If not, race isn't the
+            // issue and we should look elsewhere.
+            static const int kSyncDelayUs = [](){
+                const char* v = std::getenv("BVR_SYNC_DELAY");
+                int us = v ? atoi(v) : 0;
+                std::fprintf(stderr, "[BetterVR-Linux] SyncDelay=%d us\n", us);
+                return us;
+            }();
+            if (kSyncDelayUs > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(kSyncDelayUs));
             }
             for (int eye = 0; eye < 2; ++eye) {
                 int srcEye = kSwapEyes ? (1 - eye) : eye;
@@ -1612,8 +1716,8 @@ static void RunFrameLoop(XrInstance xrInstance,
                 // swapchain isn't updated this frame (bothFresh = false).
                 int32_t dstW_full = (int32_t)eyeW;
                 int32_t dstH_full = (int32_t)eyeH;
-                int32_t srcW = (int32_t)shareds[0][srcEye].width;
-                int32_t srcH = (int32_t)shareds[0][srcEye].height;
+                int32_t srcW = (int32_t)shareds[slot][0][srcEye].width;
+                int32_t srcH = (int32_t)shareds[slot][0][srcEye].height;
                 int32_t dstW = dstW_full;
                 int32_t dstH = dstH_full;
                 if (srcW > 0 && srcH > 0) {
@@ -1655,8 +1759,8 @@ static void RunFrameLoop(XrInstance xrInstance,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                        0, nullptr, 0, nullptr, 1, &toClear);
 
-                VkImage chosen = importedImages[0][srcEye];   // 3D layer
-                VkImage chosen2D = importedImages[1][srcEye]; // 2D HUD layer
+                VkImage chosen = importedImages[slot][0][srcEye];   // 3D layer (from picked slot)
+                VkImage chosen2D = importedImages[slot][1][srcEye]; // 2D HUD layer (from picked slot)
                 if (chosen != VK_NULL_HANDLE) {
                     VkImageBlit blit = {};
                     blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -1813,10 +1917,22 @@ static void RunFrameLoop(XrInstance xrInstance,
                 int e1 = kSwapEyes ? 0 : 1;
                 if (g_renderedFovValid[e0]) projViews[0].fov = g_renderedFov[e0];
                 if (g_renderedFovValid[e1]) projViews[1].fov = g_renderedFov[e1];
-                std::lock_guard<std::mutex> lkPose(g_capturedPoseMutex);
-                if (g_capturedPoseValid[0][e0]) projViews[0].pose = g_capturedPose[0][e0];
-                if (g_capturedPoseValid[0][e1]) projViews[1].pose = g_capturedPose[0][e1];
+                // Use the slot's snapshotted views — both eyes' poses come
+                // from the same xrLocateViews call (the one taken at the
+                // start of the BotW frame that produced the captured image).
+                // The OpenXR runtime async-timewarps the captured image
+                // from this render-time pose to the live display-time pose,
+                // giving smooth head rotation regardless of BotW framerate.
+                std::lock_guard<std::mutex> lkSlot(g_slotViewsMutex);
+                if (g_slotViewsValid[slot]) {
+                    projViews[0].pose = g_slotViews[slot].v[e0].pose;
+                    projViews[1].pose = g_slotViews[slot].v[e1].pose;
+                }
             }
+            // Consume the slot: reset its flags so BotW can fill it again.
+            // Only reset if we actually had a fully-complete slot to submit —
+            // otherwise we'd lose partial captures from BotW.
+            if (submitSlot >= 0) SlotReset(submitSlot);
         }
 
         // Unused stub left over from the old quad path — kept to minimize
@@ -1879,8 +1995,8 @@ static void RunFrameLoop(XrInstance xrInstance,
                 return -1;
             }();
             int displayEye = (kForceEye >= 0) ? kForceEye : (int)(frameNo & 1);
-            VkImage chosen = importedImages[0][displayEye]; // legacy path: 3D layer
-            const SharedImage& chosenShared = shareds[0][displayEye];
+            VkImage chosen = importedImages[0][0][displayEye]; // legacy path: 3D layer, slot 0
+            const SharedImage& chosenShared = shareds[0][0][displayEye];
 
             if (chosen != VK_NULL_HANDLE && !kForceHue) {
                 // Blit the imported (Cemu-side) image to the swapchain image.
@@ -1962,6 +2078,17 @@ static void RunFrameLoop(XrInstance xrInstance,
                 g_hookState.hitsLightPrePass.load(std::memory_order_relaxed),
                 g_currentEye.load(std::memory_order_relaxed),
                 g_activeSwapImageIndex.load(std::memory_order_relaxed));
+            std::fprintf(stderr,
+                "[BetterVR-Linux] Slots: capL[s0=%lu s1=%lu] capR[s0=%lu s1=%lu] cap2D[s0=%lu s1=%lu] picks[s0=%lu s1=%lu none=%lu]\n",
+                g_capturePerSlotEye[0][0].load(std::memory_order_relaxed),
+                g_capturePerSlotEye[1][0].load(std::memory_order_relaxed),
+                g_capturePerSlotEye[0][1].load(std::memory_order_relaxed),
+                g_capturePerSlotEye[1][1].load(std::memory_order_relaxed),
+                g_capturePerSlot2D[0].load(std::memory_order_relaxed),
+                g_capturePerSlot2D[1].load(std::memory_order_relaxed),
+                g_slotPicks[0].load(std::memory_order_relaxed),
+                g_slotPicks[1].load(std::memory_order_relaxed),
+                g_slotPicks[2].load(std::memory_order_relaxed));
         }
     }
 
@@ -2438,9 +2565,14 @@ public:
         }
         int raw = pColor ? ClassifyMagicColor(*pColor) : -1;
         // 0/1 = 2D HUD; 10/11 = 3D scene. We capture both into separate eye
-        // images (g_eyeImages[0][eye] = 3D, g_eyeImages[1][eye] = 2D).
+        // images (g_eyeImages[slot][0][eye] = 3D, g_eyeImages[slot][1][eye] = 2D).
         int magicLayer = (raw >= 10) ? 0 : (raw >= 0 ? 1 : -1);
         int magicEye   = (raw >= 0) ? (raw % 10) : -1;
+        // Ring-buffer slot encoded in the alpha channel by the BetterVR
+        // PPC patch (currentFrameCounter, alternates 0/1 per BotW frame).
+        // This makes each slot atomically owned by either BotW (writer) or
+        // our XR FrameLoop (reader) — no race on the image contents.
+        int slot = (pColor && pColor->float32[3] < 0.5f) ? 0 : 1;
         if (magicEye >= 0 && image != VK_NULL_HANDLE) {
             bool newly = false;
             {
@@ -2469,7 +2601,7 @@ public:
             // and a "captured-this-frame" gate both starved the capture of
             // legitimate 3D-buffer content. Capturing on every magic clear is
             // wasteful but empirically gives the user the freshest content.
-            InjectPreClearCapture(pDispatch, commandBuffer, image, imageLayout, magicLayer, magicEye);
+            InjectPreClearCapture(pDispatch, commandBuffer, image, imageLayout, slot, magicLayer, magicEye);
         }
         pDispatch.CmdClearColorImage(commandBuffer, image, imageLayout,
                                      pColor, rangeCount, pRanges);
@@ -2782,7 +2914,7 @@ private:
     static void InjectPerEyeCopy(const vkroots::VkCommandBufferDispatch& dd, VkCommandBuffer cb, int eye);
     static void InjectPreClearCapture(const vkroots::VkCommandBufferDispatch& dd,
                                       VkCommandBuffer cb, VkImage src,
-                                      VkImageLayout srcLayout, int layer, int eye);
+                                      VkImageLayout srcLayout, int slot, int layer, int eye);
 
     // Decide the per-cmdbuf eye marker from a list of attachment images.
     //   Returns -1 if any attachment is a swapchain image — used to mean
@@ -3155,36 +3287,37 @@ void VkDeviceOverrides::InjectPerEyeCopy(const vkroots::VkCommandBufferDispatch&
 //      (it expects whatever Cemu set)
 void VkDeviceOverrides::InjectPreClearCapture(const vkroots::VkCommandBufferDispatch& dd,
                                               VkCommandBuffer cb, VkImage src,
-                                              VkImageLayout srcLayout, int layer, int eye)
+                                              VkImageLayout srcLayout, int slot, int layer, int eye)
 {
-    if (layer < 0 || layer > 1 || eye < 0 || eye > 1) return;
+    if (slot < 0 || slot > 1 || layer < 0 || layer > 1 || eye < 0 || eye > 1) return;
     SharedImage shared;
     {
         std::lock_guard<std::mutex> lk(g_handlesMutex);
-        shared = g_eyeImages[layer][eye];
+        shared = g_eyeImages[slot][layer][eye];
     }
     if (shared.cemuImage == VK_NULL_HANDLE) return;
 
-    // Pair this capture with the head pose BotW used to render its content.
-    // Pop the per-eye pose queue (filled by Hook_GetRenderCamera). If the
-    // queue is empty (capture happened without a matching camera-hook fire,
-    // e.g., menu-only frames), fall back to the latest known pose. Also
-    // flag this eye as fresh — the FrameLoop won't consume until BOTH
-    // eyes' flags are set (port of upstream's Is3DComplete() gate).
+    // Per-slot pose snapshot. Update on EVERY capture so the pose always
+    // matches the image content currently in the slot. BotW may write the
+    // same slot multiple times between XR consumes (when BotW > XR rate);
+    // upstream's "snapshot on first capture only" would leave the views
+    // stale relative to the latest image write, causing pose-image
+    // mismatch and visible reprojection jitter.
     {
-        std::lock_guard<std::mutex> lk(g_capturedPoseMutex);
-        if (!g_renderedPoseQueue[eye].empty()) {
-            g_capturedPose[layer][eye] = g_renderedPoseQueue[eye].front();
-            g_renderedPoseQueue[eye].pop_front();
-            g_capturedPoseValid[layer][eye] = true;
-        } else {
-            XrPosef fallback = {};
-            if (g_hookState.getPose(eye, &fallback)) {
-                g_capturedPose[layer][eye] = fallback;
-                g_capturedPoseValid[layer][eye] = true;
-            }
+        XrPosef pose0 = {}, pose1 = {};
+        bool ok0 = g_hookState.getPose(0, &pose0);
+        bool ok1 = g_hookState.getPose(1, &pose1);
+        if (ok0 && ok1) {
+            std::lock_guard<std::mutex> lk(g_slotViewsMutex);
+            std::lock_guard<std::mutex> lk2(g_hookState.mtx);
+            g_slotViews[slot].v[0].type = XR_TYPE_VIEW;
+            g_slotViews[slot].v[1].type = XR_TYPE_VIEW;
+            g_slotViews[slot].v[0].pose = pose0;
+            g_slotViews[slot].v[1].pose = pose1;
+            if (g_hookState.fovValid[0]) g_slotViews[slot].v[0].fov = g_hookState.fov[0];
+            if (g_hookState.fovValid[1]) g_slotViews[slot].v[1].fov = g_hookState.fov[1];
+            g_slotViewsValid[slot] = true;
         }
-        if (layer == 0) g_imageFresh[eye] = true;
     }
 
     VkImageSubresourceRange one = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -3260,6 +3393,20 @@ void VkDeviceOverrides::InjectPreClearCapture(const vkroots::VkCommandBufferDisp
 
     g_injectedCopies.fetch_add(1, std::memory_order_relaxed);
     g_injectedCopiesPerEye[eye].fetch_add(1, std::memory_order_relaxed);
+
+    // Mark this slot's per-eye capture complete (3D color or 2D HUD).
+    // The XR FrameLoop reads these to pick a fully-complete slot to submit.
+    // memory_order_release pairs with the FrameLoop's acquire load on the
+    // same atomics — ensures the blit's destination memory is observable.
+    if (layer == 0) {
+        g_slotCopiedColor[slot][eye].store(true, std::memory_order_release);
+        g_capturePerSlotEye[slot][eye].fetch_add(1, std::memory_order_relaxed);
+    } else if (layer == 1 && eye == 0) {
+        // Upstream only fires the 2D capture for the LEFT eye (the 2D layer
+        // is mono — same content goes to both eyes via XrCompositionLayerQuad).
+        g_slotCopied2D[slot].store(true, std::memory_order_release);
+        g_capturePerSlot2D[slot].fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 } // namespace bvr_linux
