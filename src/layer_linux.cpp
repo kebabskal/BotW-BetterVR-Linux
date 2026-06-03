@@ -650,10 +650,31 @@ static void Hook_FixUIBlending(PPCInterpreter_t* hCPU) {
     uint32_t alphaSrc = hCPU->gpr[8], alphaDst = hCPU->gpr[9], alphaComb = hCPU->gpr[10];
     bool matchesColor = colorSrc == BF_DST_COLOR && colorDst == BF_SRC_ALPHA && colorComb == CF_DST_PLUS_SRC;
     bool matchesAlpha = alphaSrc == BF_SRC_ALPHA && alphaDst == BF_ONE_MINUS_SRC_ALPHA && alphaComb == CF_DST_PLUS_SRC;
+    static std::atomic<uint64_t> s_calls{0}, s_matched{0};
+    s_calls.fetch_add(1, std::memory_order_relaxed);
     if (matchesColor && matchesAlpha) {
+        s_matched.fetch_add(1, std::memory_order_relaxed);
         hCPU->gpr[7] = 1;                          // enable separate alpha
         hCPU->gpr[8] = BF_ZERO;                    // alphaSrc
         hCPU->gpr[9] = BF_DST_ALPHA;               // alphaDst
+    }
+    // Log the first few unique (colorSrc, colorDst, colorComb, alphaSrc,
+    // alphaDst, alphaComb) tuples we observe so we can see what blend
+    // states BotW actually uses on Linux — the upstream hook only
+    // recognises one pattern and we suspect Linux/Cemu uses different
+    // ones.
+    static std::mutex s_seenMtx;
+    static std::set<uint64_t> s_seen;
+    uint64_t key = ((uint64_t)colorSrc << 0) | ((uint64_t)colorDst << 8)
+                 | ((uint64_t)colorComb << 16) | ((uint64_t)alphaSrc << 24)
+                 | ((uint64_t)alphaDst << 32) | ((uint64_t)alphaComb << 40);
+    {
+        std::lock_guard<std::mutex> lk(s_seenMtx);
+        if (s_seen.size() < 16 && s_seen.insert(key).second) {
+            std::fprintf(stderr,
+                "[BetterVR-Linux] FixUIBlending observed tuple: cSrc=0x%02x cDst=0x%02x cComb=%u | aSrc=0x%02x aDst=0x%02x aComb=%u\n",
+                colorSrc, colorDst, colorComb, alphaSrc, alphaDst, alphaComb);
+        }
     }
 }
 
