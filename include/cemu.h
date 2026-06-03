@@ -115,7 +115,7 @@ struct VPADStatus {
     uint8_t slideVolume2;
     uint8_t padding4[8];
 };
-static_assert(sizeof(VPADStatus) == 0xAC);
+BVR_SIZE_CHECK(sizeof(VPADStatus) == 0xAC, "VPADStatus size mismatch");
 
 typedef void (*osLib_registerHLEFunctionPtr_t)(const char* libraryName, const char* functionName, void (*osFunction)(PPCInterpreter_t* hCPU));
 typedef void* (*memory_getBasePtr_t)();

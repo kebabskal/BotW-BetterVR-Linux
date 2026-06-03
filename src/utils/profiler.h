@@ -277,8 +277,11 @@ private:
 
     inline static std::atomic_bool s_enabled = false;
     inline static std::atomic_uint32_t s_spanGeneration = 1;
-    inline static std::array<SectionState, kSectionCount> s_states = {};
-    inline static thread_local ThreadSpanState s_threadSpanState = {};
+    // Declared here, defined below the class so the nested types are complete.
+    // Without this MSVC accepts the in-class `= {}` but Clang correctly rejects
+    // it (default member initializers of incomplete nested classes).
+    static std::array<SectionState, kSectionCount> s_states;
+    static thread_local ThreadSpanState s_threadSpanState;
     inline static constexpr std::array<const char*, kSectionCount> s_sectionNames = {
         "Roomscale Resolve",
         "Roomscale Begin",
@@ -346,3 +349,10 @@ private:
         }
     }
 };
+
+// Out-of-class definitions for the static members that reference incomplete
+// nested types when declared inline. `inline` keeps them ODR-safe in a header.
+inline std::array<BetterVRProfiler::SectionState, BetterVRProfiler::kSectionCount>
+    BetterVRProfiler::s_states{};
+inline thread_local BetterVRProfiler::ThreadSpanState
+    BetterVRProfiler::s_threadSpanState{};

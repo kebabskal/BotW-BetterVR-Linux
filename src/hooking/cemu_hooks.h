@@ -5,12 +5,24 @@
 class CemuHooks {
 public:
     CemuHooks() {
+#if BETTERVR_HAS_WIN32
         m_cemuHandle = GetModuleHandleA(NULL);
         checkAssert(m_cemuHandle != NULL, "Failed to get handle of Cemu process which is required for interfacing with Cemu!");
 
         gameMeta_getTitleId = (gameMeta_getTitleIdPtr_t)GetProcAddress(m_cemuHandle, "gameMeta_getTitleId");
         memory_getBase = (memory_getBasePtr_t)GetProcAddress(m_cemuHandle, "memory_getBase");
         osLib_registerHLEFunction = (osLib_registerHLEFunctionPtr_t)GetProcAddress(m_cemuHandle, "osLib_registerHLEFunction");
+#else
+        // On Linux, pass NULL to dlopen to grab a handle to the running executable.
+        // Cemu must be linked with -rdynamic and the relevant functions marked
+        // DLLEXPORT (= __attribute__((visibility("default")))) for dlsym to find them.
+        m_cemuHandle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+        checkAssert(m_cemuHandle != NULL, "Failed to get handle of Cemu process which is required for interfacing with Cemu!");
+
+        gameMeta_getTitleId = (gameMeta_getTitleIdPtr_t)dlsym(m_cemuHandle, "gameMeta_getTitleId");
+        memory_getBase = (memory_getBasePtr_t)dlsym(m_cemuHandle, "memory_getBase");
+        osLib_registerHLEFunction = (osLib_registerHLEFunctionPtr_t)dlsym(m_cemuHandle, "osLib_registerHLEFunction");
+#endif
         checkAssert(gameMeta_getTitleId != nullptr && memory_getBase != nullptr && osLib_registerHLEFunction != nullptr, "Failed to get function pointers of Cemu functions! Is this hook being used on Cemu?");
 
         bool isSupportedTitleId = gameMeta_getTitleId() == 0x00050000101C9300 || gameMeta_getTitleId() == 0x00050000101C9400 || gameMeta_getTitleId() == 0x00050000101C9500;
@@ -96,11 +108,22 @@ public:
         osLib_registerHLEFunction("coreinit", "hook_VisualizeRayCastHits", &hook_VisualizeRayCastHits);
     };
     ~CemuHooks() {
+#if BETTERVR_HAS_WIN32
         FreeLibrary(m_cemuHandle);
+#else
+        if (m_cemuHandle) dlclose(m_cemuHandle);
+#endif
     };
 
+#if BETTERVR_HAS_WIN32
     static HWND m_cemuTopWindow;
     static HWND m_cemuRenderWindow;
+#else
+    // Linux: window handles aren't used for the layer-only port (yet).
+    // Placeholders kept to avoid threading them through every consumer.
+    static void* m_cemuTopWindow;
+    static void* m_cemuRenderWindow;
+#endif
     static uint64_t s_memoryBaseAddress;
 
     std::unique_ptr<class EntityDebugger> m_entityDebugger;
@@ -167,7 +190,11 @@ public:
     }
 
 private:
+#if BETTERVR_HAS_WIN32
     HMODULE m_cemuHandle;
+#else
+    void* m_cemuHandle;
+#endif
 
     osLib_registerHLEFunctionPtr_t osLib_registerHLEFunction;
     memory_getBasePtr_t memory_getBase;

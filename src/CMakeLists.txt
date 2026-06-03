@@ -1,17 +1,24 @@
 add_library(BetterVR_Layer SHARED)
 
-file(GENERATE OUTPUT "$<TARGET_FILE_DIR:BetterVR_Layer>/BetterVR_Layer.json" INPUT "${CMAKE_SOURCE_DIR}/resources/BetterVR_Layer.json")
-file(GENERATE OUTPUT "$<TARGET_FILE_DIR:BetterVR_Layer>/BetterVR_Layer.direct.json" INPUT "${CMAKE_SOURCE_DIR}/resources/BetterVR_Layer.direct.json")
+if(WIN32)
+    file(GENERATE OUTPUT "$<TARGET_FILE_DIR:BetterVR_Layer>/BetterVR_Layer.json" INPUT "${CMAKE_SOURCE_DIR}/resources/BetterVR_Layer.json")
+    file(GENERATE OUTPUT "$<TARGET_FILE_DIR:BetterVR_Layer>/BetterVR_Layer.direct.json" INPUT "${CMAKE_SOURCE_DIR}/resources/BetterVR_Layer.direct.json")
+    target_link_options(BetterVR_Layer PRIVATE "$<$<CONFIG:Debug>:/INCREMENTAL>")
+endif()
 
-target_link_options(BetterVR_Layer PRIVATE "$<$<CONFIG:Debug>:/INCREMENTAL>")
 target_precompile_headers(BetterVR_Layer PRIVATE ${CMAKE_SOURCE_DIR}/include/pch.h)
 target_include_directories(BetterVR_Layer BEFORE PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(BetterVR_Layer AFTER PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+if(UNIX AND NOT APPLE)
+    # Phase 2A Linux smoke test: build only the minimal layer entry. The full
+    # BetterVR rendering pipeline is still tied to D3D12 and needs the OpenXR
+    # binding rewrite (Phase 2B) before it can build on Linux.
+    target_sources(BetterVR_Layer PRIVATE ${CMAKE_SOURCE_DIR}/src/layer_linux.cpp)
+else()
 target_sources(BetterVR_Layer PUBLIC
     ${CMAKE_SOURCE_DIR}/src/instance.h
     ${CMAKE_SOURCE_DIR}/src/shader.h
-    ${CMAKE_SOURCE_DIR}/src/utils/d3d12_utils.h
     ${CMAKE_SOURCE_DIR}/src/utils/vulkan_utils.h
     ${CMAKE_SOURCE_DIR}/src/utils/game_utils.h
     ${CMAKE_SOURCE_DIR}/src/utils/logger.cpp
@@ -41,8 +48,6 @@ target_sources(BetterVR_Layer PUBLIC
     ${CMAKE_SOURCE_DIR}/src/hooking/skeleton.cpp
     ${CMAKE_SOURCE_DIR}/src/hooking/openxr_motion_bridge.h
     ${CMAKE_SOURCE_DIR}/src/hooking/entity_controller.cpp
-    ${CMAKE_SOURCE_DIR}/src/rendering/d3d12.cpp
-    ${CMAKE_SOURCE_DIR}/src/rendering/d3d12.h
     ${CMAKE_SOURCE_DIR}/src/rendering/renderer.cpp
     ${CMAKE_SOURCE_DIR}/src/rendering/renderer.h
     ${CMAKE_SOURCE_DIR}/src/rendering/openxr.cpp
@@ -55,6 +60,14 @@ target_sources(BetterVR_Layer PUBLIC
     ${CMAKE_SOURCE_DIR}/src/rendering/vulkan.h
     ${CMAKE_SOURCE_DIR}/src/rendering/vulkan_imgui.cpp
 )
+
+# D3D12-specific sources only on Windows.
+target_sources(BetterVR_Layer PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/utils/d3d12_utils.h
+    ${CMAKE_SOURCE_DIR}/src/rendering/d3d12.cpp
+    ${CMAKE_SOURCE_DIR}/src/rendering/d3d12.h
+)
+endif() # UNIX-vs-WIN32 source-set split
 
 file(GLOB_RECURSE GRAPHIC_PACK_FILES "${CMAKE_SOURCE_DIR}/resources/BreathOfTheWild_BetterVR/*")
 if(GRAPHIC_PACK_FILES)
@@ -89,9 +102,12 @@ endif()
 
 install(TARGETS BetterVR_Layer
     RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_PREFIX}"
 )
-install(FILES "$<TARGET_FILE_DIR:BetterVR_Layer>/BetterVR_Layer.direct.json" DESTINATION "${CMAKE_INSTALL_PREFIX}")
-install(FILES $<TARGET_PDB_FILE:BetterVR_Layer> DESTINATION "${CMAKE_INSTALL_PREFIX}" CONFIGURATIONS Debug RelWithDebInfo OPTIONAL)
+if(WIN32)
+    install(FILES "$<TARGET_FILE_DIR:BetterVR_Layer>/BetterVR_Layer.direct.json" DESTINATION "${CMAKE_INSTALL_PREFIX}")
+    install(FILES $<TARGET_PDB_FILE:BetterVR_Layer> DESTINATION "${CMAKE_INSTALL_PREFIX}" CONFIGURATIONS Debug RelWithDebInfo OPTIONAL)
+endif()
 
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/resources/BreathOfTheWild_BetterVR/"
     DESTINATION "${BETTERVR_GRAPHIC_PACK_INSTALL_DIR}"
@@ -103,8 +119,19 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/resources/BreathOfTheWild_BetterVR/"
     PATTERN "patch_debug_*.asm" EXCLUDE
 )
 
-set_target_properties(BetterVR_Layer PROPERTIES
-    VS_DEBUGGER_COMMAND "${CMAKE_INSTALL_PREFIX}/Cemu.exe"
-    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_INSTALL_PREFIX}"
-    VS_DEBUGGER_ENVIRONMENT "ENABLE_BETTERVR_MOD=1"
-)
+if(WIN32)
+    set_target_properties(BetterVR_Layer PROPERTIES
+        VS_DEBUGGER_COMMAND "${CMAKE_INSTALL_PREFIX}/Cemu.exe"
+        VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_INSTALL_PREFIX}"
+        VS_DEBUGGER_ENVIRONMENT "ENABLE_BETTERVR_MOD=1"
+    )
+endif()
+
+if(UNIX AND NOT APPLE)
+    # Vulkan loader expects layer .so files named libVkLayer_*.so by convention
+    set_target_properties(BetterVR_Layer PROPERTIES
+        OUTPUT_NAME "VkLayer_BetterVR"
+        PREFIX "lib"
+    )
+    target_link_libraries(BetterVR_Layer PRIVATE ${CMAKE_DL_LIBS})
+endif()

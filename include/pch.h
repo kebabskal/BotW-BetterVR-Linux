@@ -19,17 +19,31 @@
 #include <algorithm>
 #include <cctype>
 
-#include <Windows.h>
-#include <winrt/base.h>
-#include <shellapi.h>
+#if defined(_WIN32)
+    #define BETTERVR_HAS_D3D12 1
+    #define BETTERVR_HAS_WIN32 1
+#else
+    #define BETTERVR_HAS_D3D12 0
+    #define BETTERVR_HAS_WIN32 0
+#endif
 
+#if BETTERVR_HAS_WIN32
+    #include <Windows.h>
+    #include <winrt/base.h>
+    #include <shellapi.h>
 
-// These macros mess with some of Vulkan's functions
-#undef ERROR
-#undef CreateEvent
-#undef CreateSemaphore
+    // These macros mess with some of Vulkan's functions
+    #undef ERROR
+    #undef CreateEvent
+    #undef CreateSemaphore
 
-#define VK_USE_PLATFORM_WIN32_KHR
+    #define VK_USE_PLATFORM_WIN32_KHR
+#else
+    #include <dlfcn.h>
+    #include <cstdint>
+    #include "win32_compat_linux.h"
+#endif
+
 #define VK_NO_PROTOTYPES
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan_core.h>
@@ -38,23 +52,31 @@
 #define VKROOTS_NEGOTIATION_INTERFACE VRLayer_NegotiateLoaderLayerInterfaceVersion
 #include "vkroots.h"
 
-// D3D12 includes
-#include <d3d12.h>
-#include <D3Dcompiler.h>
-#include <dxgi1_6.h>
+#if BETTERVR_HAS_D3D12
+    // D3D12 includes
+    #include <d3d12.h>
+    #include <D3Dcompiler.h>
+    #include <dxgi1_6.h>
 
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "D3DCompiler.lib")
-#pragma comment(lib, "dxguid.lib")
+    #pragma comment(lib, "d3d12.lib")
+    #pragma comment(lib, "dxgi.lib")
+    #pragma comment(lib, "D3DCompiler.lib")
+    #pragma comment(lib, "dxguid.lib")
 
-#include <wrl/client.h>
+    #include <wrl/client.h>
 
-using Microsoft::WRL::ComPtr;
+    using Microsoft::WRL::ComPtr;
+#endif
 
 // OpenXR includes
-#define XR_USE_PLATFORM_WIN32
-#define XR_USE_GRAPHICS_API_D3D12
+#if BETTERVR_HAS_WIN32
+    #define XR_USE_PLATFORM_WIN32
+#endif
+#if BETTERVR_HAS_D3D12
+    #define XR_USE_GRAPHICS_API_D3D12
+#else
+    #define XR_USE_GRAPHICS_API_VULKAN
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -137,13 +159,40 @@ inline uint32_t stringToHash(const char* str) {
 }
 
 inline std::string wcharToUtf8(const wchar_t* wstr) {
+#if BETTERVR_HAS_WIN32
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
     std::string str(size_needed, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &str[0], size_needed, nullptr, nullptr);
     return str;
+#else
+    // Minimal portable conversion (assumes wchar_t holds UCS-4 / UCS-2 on Linux)
+    std::string out;
+    if (!wstr) return out;
+    for (; *wstr; ++wstr) {
+        wchar_t c = *wstr;
+        if (c < 0x80) {
+            out += static_cast<char>(c);
+        } else if (c < 0x800) {
+            out += static_cast<char>(0xC0 | (c >> 6));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out += static_cast<char>(0xE0 | (c >> 12));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (c >> 18));
+            out += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+#endif
 }
 
-#define PADDED_BYTES(from, up) uint8_t byte_##from##[ ## (up-from+0x04) ## ]
+// Token-paste only between byte_ and the hex literal — the brackets stay as
+// regular tokens. MSVC tolerated the extra `##` non-standardly; Clang doesn't.
+#define PADDED_BYTES(from, up) uint8_t byte_##from[(up-from+0x04)]
 
 template<class T, template<class...> class U>
 inline constexpr bool is_instance_of_v = std::false_type{};
@@ -251,11 +300,17 @@ inline T swapEndianness(T val) {
     }
 }
 
-struct BETypeCompatible {
-};
+// Tag marker. Previously this was an empty base class that BE-wrapping structs
+// inherited from to be picked up by is_BEType_v. On MSVC that subobject was
+// elided under #pragma pack(1) (EBO), but Linux clang allocates 1 byte plus
+// trailing padding for each empty base, growing every BE struct by 4 bytes
+// and breaking the Wii U memory layout. We now detect BE wrappers by an inner
+// `using is_be_type = BETypeTag` alias instead of inheritance.
+struct BETypeTag {};
 
 template<typename T>
-struct BEType : BETypeCompatible {
+struct BEType {
+    using is_be_type = BETypeTag;
     T val;
 
     BEType() = default;
@@ -311,10 +366,14 @@ struct BEType : BETypeCompatible {
 };
 
 
-template<typename T>
-inline constexpr bool is_BEType_v = std::is_base_of_v<BETypeCompatible, T>;
+template<typename T, typename = void>
+inline constexpr bool is_BEType_v = false;
 
-struct BEVec2 : BETypeCompatible {
+template<typename T>
+inline constexpr bool is_BEType_v<T, std::void_t<typename T::is_be_type>> = true;
+
+struct BEVec2 {
+    using is_be_type = BETypeTag;
     BEType<float> x;
     BEType<float> y;
 
@@ -327,7 +386,8 @@ struct BEVec2 : BETypeCompatible {
     }
 };
 
-struct BEVec3 : BETypeCompatible {
+struct BEVec3 {
+    using is_be_type = BETypeTag;
     BEType<float> x;
     BEType<float> y;
     BEType<float> z;
@@ -355,7 +415,8 @@ struct BEVec3 : BETypeCompatible {
     }
 };
 
-struct BEMatrix34 : BETypeCompatible {
+struct BEMatrix34 {
+    using is_be_type = BETypeTag;
     BEType<float> x_x;
     BEType<float> y_x;
     BEType<float> z_x;
@@ -445,7 +506,8 @@ struct BEMatrix34 : BETypeCompatible {
     }
 };
 
-struct BEMatrix44 : BETypeCompatible {
+struct BEMatrix44 {
+    using is_be_type = BETypeTag;
     BEType<float> a00;
     BEType<float> a01;
     BEType<float> a02;
@@ -521,8 +583,13 @@ struct BESeadPerspectiveProjection : BESeadProjection {
     BEVec2 offset;
 };
 #pragma pack(pop)
-static_assert(sizeof(BESeadProjection) == 0x94, "BESeadProjection size mismatch");
-static_assert(sizeof(BESeadPerspectiveProjection) == 0xB8, "BESeadPerspectiveProjection size mismatch");
+// BE-wrapped structs no longer inherit from a marker base, so their layouts
+// match the Wii U memory layout on both MSVC and Linux clang under
+// #pragma pack(1). Size checks are now unconditional.
+#define BVR_SIZE_CHECK(expr, msg) static_assert(expr, msg)
+
+BVR_SIZE_CHECK(sizeof(BESeadProjection) == 0x94, "BESeadProjection size mismatch");
+BVR_SIZE_CHECK(sizeof(BESeadPerspectiveProjection) == 0xB8, "BESeadPerspectiveProjection size mismatch");
 
 struct data_VRProjectionMatrixOut {
     BEType<float> aspectRatio;

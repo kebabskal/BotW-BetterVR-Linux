@@ -36,14 +36,14 @@ struct RoomscaleRaycastScratch {
     BEVec3 hitNormal = {};
 };
 
-static_assert(offsetof(RoomscaleRaycastScratch, currentPos) == 0x00, "Roomscale scratch current position offset mismatch");
-static_assert(offsetof(RoomscaleRaycastScratch, castFrom) == 0x0C, "Roomscale scratch cast from offset mismatch");
-static_assert(offsetof(RoomscaleRaycastScratch, castDelta) == 0x18, "Roomscale scratch cast delta offset mismatch");
-static_assert(offsetof(RoomscaleRaycastScratch, hitPos) == 0x24, "Roomscale scratch hit offset mismatch");
-static_assert(offsetof(RoomscaleRaycastScratch, groundHit) == 0x30, "Roomscale scratch ground-hit offset mismatch");
-static_assert(offsetof(RoomscaleRaycastScratch, queryType) == 0x34, "Roomscale scratch query-type offset mismatch");
-static_assert(offsetof(RoomscaleRaycastScratch, sweepRadius) == 0x38, "Roomscale scratch sweep-radius offset mismatch");
-static_assert(offsetof(RoomscaleRaycastScratch, hitNormal) == 0x3C, "Roomscale scratch hit-normal offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, currentPos) == 0x00, "Roomscale scratch current position offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, castFrom) == 0x0C, "Roomscale scratch cast from offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, castDelta) == 0x18, "Roomscale scratch cast delta offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, hitPos) == 0x24, "Roomscale scratch hit offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, groundHit) == 0x30, "Roomscale scratch ground-hit offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, queryType) == 0x34, "Roomscale scratch query-type offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, sweepRadius) == 0x38, "Roomscale scratch sweep-radius offset mismatch");
+BVR_SIZE_CHECK(offsetof(RoomscaleRaycastScratch, hitNormal) == 0x3C, "Roomscale scratch hit-normal offset mismatch");
 static_assert(sizeof(RoomscaleRaycastScratch) == 0x48, "Roomscale scratch size mismatch");
 
 struct RoomscaleSupportState {

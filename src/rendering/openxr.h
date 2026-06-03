@@ -15,8 +15,10 @@ public:
     };
 
     struct Capabilities {
+#if BETTERVR_HAS_D3D12
         LUID adapter;
         D3D_FEATURE_LEVEL minFeatureLevel;
+#endif
         bool supportsOrientational;
         bool supportsPositional;
         bool supportsMutatableFOV;
@@ -174,7 +176,12 @@ public:
     } rumbleParameters ;
     std::atomic<RumbleParameters> m_rumbleParameters{};
 
+#if BETTERVR_HAS_D3D12
     void CreateSession(const XrGraphicsBindingD3D12KHR& d3d12Binding);
+#else
+    // TODO(linux-port): replace with XrGraphicsBindingVulkanKHR in Phase 2B.
+    void CreateSession();
+#endif
     void CreateActions();
     std::array<XrViewConfigurationView, 2> GetViewConfigurations();
     std::optional<XrSpaceLocation> UpdateSpaces(XrTime predictedDisplayTime);
@@ -252,9 +259,13 @@ private:
 
     XrDebugUtilsMessengerEXT m_debugMessengerHandle = XR_NULL_HANDLE;
 
+#if BETTERVR_HAS_D3D12
     PFN_xrGetD3D12GraphicsRequirementsKHR func_xrGetD3D12GraphicsRequirementsKHR = nullptr;
     PFN_xrConvertTimeToWin32PerformanceCounterKHR func_xrConvertTimeToWin32PerformanceCounterKHR = nullptr;
     PFN_xrConvertWin32PerformanceCounterToTimeKHR func_xrConvertWin32PerformanceCounterToTimeKHR = nullptr;
+#else
+    PFN_xrGetVulkanGraphicsRequirementsKHR func_xrGetVulkanGraphicsRequirementsKHR = nullptr;
+#endif
     PFN_xrCreateDebugUtilsMessengerEXT func_xrCreateDebugUtilsMessengerEXT = nullptr;
     PFN_xrDestroyDebugUtilsMessengerEXT func_xrDestroyDebugUtilsMessengerEXT = nullptr;
 };

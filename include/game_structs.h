@@ -2,7 +2,7 @@
 
 #pragma pack(push, 1)
 namespace sead {
-    struct SafeString : BETypeCompatible {
+    struct SafeString {
         BEType<uint32_t> c_str;
         BEType<uint32_t> vtable;
     };
@@ -10,7 +10,7 @@ namespace sead {
     struct BufferedSafeString : SafeString {
         BEType<int32_t> length;
     };
-    static_assert(sizeof(BufferedSafeString) == 0x0C, "BufferedSafeString size mismatch");
+    BVR_SIZE_CHECK(sizeof(BufferedSafeString) == 0x0C, "BufferedSafeString size mismatch");
 
     struct FixedSafeString40 : BufferedSafeString {
         char data[0x40];
@@ -22,7 +22,7 @@ namespace sead {
             return std::string(data, strnlen(data, sizeof(data)));
         }
     };
-    static_assert(sizeof(FixedSafeString40) == 0x4C, "FixedSafeString40 size mismatch");
+    BVR_SIZE_CHECK(sizeof(FixedSafeString40) == 0x4C, "FixedSafeString40 size mismatch");
 
 	struct FixedSafeString100 : BufferedSafeString {
         char data[0x100];
@@ -34,7 +34,7 @@ namespace sead {
             return std::string(data, strnlen(data, sizeof(data)));
         }
     };
-    static_assert(sizeof(FixedSafeString100) == 0x10C, "FixedSafeString100 size mismatch");
+    BVR_SIZE_CHECK(sizeof(FixedSafeString100) == 0x10C, "FixedSafeString100 size mismatch");
 
     struct PtrArrayImpl {
         BEType<uint32_t> size;
@@ -68,7 +68,7 @@ struct BaseProc {
     PADDED_BYTES(0x54, 0xE0);
     BEType<uint32_t> vtable;
 };
-static_assert(sizeof(BaseProc) == 0xEC, "BaseProc size mismatch");
+BVR_SIZE_CHECK(sizeof(BaseProc) == 0xEC, "BaseProc size mismatch");
 
 enum ActorFlags : int32_t {
     ActorFlags_1 = 0x1,
@@ -217,17 +217,17 @@ struct ActorWiiU : BaseProc {
     BEType<float> lodDrawDistanceMultiplier;
     PADDED_BYTES(0x494, 0x538);
 };
-static_assert(offsetof(ActorWiiU, gsysModelPtr) == 0x330, "ActorWiiU.gsysModelPtr offset mismatch");
-static_assert(offsetof(ActorWiiU, modelOpacity) == 0x33C, "ActorWiiU.modelOpacity offset mismatch");
-static_assert(offsetof(ActorWiiU, modelOpacityRelated) == 0x340, "ActorWiiU.modelOpacityRelated offset mismatch");
-static_assert(offsetof(ActorWiiU, opacityOrDoFlushOpacityToGPU) == 0x436, "ActorWiiU.opacityOrDoFlushOpacityToGPU offset mismatch");
-static_assert(offsetof(ActorWiiU, velocity) == 0x25C, "ActorWiiU.velocity offset mismatch");
-static_assert(sizeof(ActorWiiU) == 0x53C, "ActorWiiU size mismatch");
+BVR_SIZE_CHECK(offsetof(ActorWiiU, gsysModelPtr) == 0x330, "ActorWiiU.gsysModelPtr offset mismatch");
+BVR_SIZE_CHECK(offsetof(ActorWiiU, modelOpacity) == 0x33C, "ActorWiiU.modelOpacity offset mismatch");
+BVR_SIZE_CHECK(offsetof(ActorWiiU, modelOpacityRelated) == 0x340, "ActorWiiU.modelOpacityRelated offset mismatch");
+BVR_SIZE_CHECK(offsetof(ActorWiiU, opacityOrDoFlushOpacityToGPU) == 0x436, "ActorWiiU.opacityOrDoFlushOpacityToGPU offset mismatch");
+BVR_SIZE_CHECK(offsetof(ActorWiiU, velocity) == 0x25C, "ActorWiiU.velocity offset mismatch");
+BVR_SIZE_CHECK(sizeof(ActorWiiU) == 0x53C, "ActorWiiU size mismatch");
 
 struct DynamicActor : ActorWiiU {
     PADDED_BYTES(0x53C, 0x7C8);
 };
-static_assert(sizeof(DynamicActor) == 0x7CC, "DynamicActor size mismatch");
+BVR_SIZE_CHECK(sizeof(DynamicActor) == 0x7CC, "DynamicActor size mismatch");
 
 struct ActorWeapon {
     PADDED_BYTES(0x00, 0x0C);
@@ -238,12 +238,12 @@ struct ActorWeapons {
     BEType<uint32_t> actorThisPtr;
     BEType<uint32_t> actorWeaponsVtblPtr;
 };
-static_assert(sizeof(ActorWeapons) == 0x068, "ActorWeapons size mismatch");
+BVR_SIZE_CHECK(sizeof(ActorWeapons) == 0x068, "ActorWeapons size mismatch");
 
 struct PlayerOrEnemy : DynamicActor, ActorWeapons {
     BEType<float> float834;
 };
-static_assert(sizeof(PlayerOrEnemy) == 0x838, "PlayerOrEnemy size mismatch");
+BVR_SIZE_CHECK(sizeof(PlayerOrEnemy) == 0x838, "PlayerOrEnemy size mismatch");
 
 // 0x18000021 for carrying the electricity balls at least
 // 0x00000010 for ladder
@@ -298,13 +298,13 @@ struct PlayerBase : PlayerOrEnemy {
     BEType<PlayerMoveBitFlags> moveBitFlags;
     PADDED_BYTES(0x8E0, 0x12A4);
 };
-static_assert(offsetof(PlayerBase, moveBitFlags) == 0x8DC, "Player.float834 offset mismatch");
-static_assert(sizeof(PlayerBase) == 0x12A8, "PlayerBase size mismatch");
+BVR_SIZE_CHECK(offsetof(PlayerBase, moveBitFlags) == 0x8DC, "Player.float834 offset mismatch");
+BVR_SIZE_CHECK(sizeof(PlayerBase) == 0x12A8, "PlayerBase size mismatch");
 
 struct Player : PlayerBase {
     PADDED_BYTES(0x12A8, 0x2524);
 };
-static_assert(sizeof(Player) == 0x2528, "Player size mismatch");
+BVR_SIZE_CHECK(sizeof(Player) == 0x2528, "Player size mismatch");
 
 struct WeaponBase : ActorWiiU {
     PADDED_BYTES(0x53C, 0x5F0);
@@ -315,8 +315,8 @@ struct WeaponBase : ActorWiiU {
     BEType<uint8_t> field_5FF;
     PADDED_BYTES(0x600, 0x72C);
 };
-static_assert(offsetof(WeaponBase, isEquippedProbably) == 0x5F8, "WeaponBase.isEquippedProbably offset mismatch");
-static_assert(sizeof(WeaponBase) == 0x72C, "WeaponBase size mismatch");
+BVR_SIZE_CHECK(offsetof(WeaponBase, isEquippedProbably) == 0x5F8, "WeaponBase.isEquippedProbably offset mismatch");
+BVR_SIZE_CHECK(sizeof(WeaponBase) == 0x72C, "WeaponBase size mismatch");
 
 struct Struct20 {
     BEType<uint32_t> __vftable;
@@ -356,7 +356,7 @@ struct DamageMgr {
     BEType<uint8_t> field_4A;
     BEType<uint8_t> field_4B;
 };
-static_assert(sizeof(DamageMgr) == 0x4C, "DamageMgr size mismatch");
+BVR_SIZE_CHECK(sizeof(DamageMgr) == 0x4C, "DamageMgr size mismatch");
 
 struct AttackSensorInitArg {
     BEType<uint32_t> mode;
@@ -381,7 +381,7 @@ struct AttackSensorInitArg {
     BEType<uint8_t> field_8A3;
     BEType<uint8_t> field_8A4;
 };
-static_assert(sizeof(AttackSensorInitArg) == 0x30, "AttackSensorInitArg size mismatch");
+BVR_SIZE_CHECK(sizeof(AttackSensorInitArg) == 0x30, "AttackSensorInitArg size mismatch");
 
 struct AttackSensorOtherArg {
     BEType<uint32_t> flags;
@@ -400,7 +400,7 @@ struct AttackSensorOtherArg {
     BEType<uint32_t> impact;
     BEType<uint32_t> comboCount;
 };
-static_assert(sizeof(AttackSensorOtherArg) == 0x24, "AttackSensorOtherArg size mismatch");
+BVR_SIZE_CHECK(sizeof(AttackSensorOtherArg) == 0x24, "AttackSensorOtherArg size mismatch");
 
 enum class WeaponType : uint32_t {
     SmallSword = 0x0,
@@ -489,10 +489,10 @@ struct Weapon : WeaponBase {
     BEType<uint16_t> otherFlags;
     PADDED_BYTES(0xA18, 0xB58);
 };
-static_assert(offsetof(Weapon, setupAttackSensor.resetAttack) == 0x8A0, "Weapon.setupAttackSensor.resetAttack offset mismatch");
-static_assert(offsetof(Weapon, setupAttackSensor.mode) == 0x874, "Weapon.setupAttackSensor.mode offset mismatch");
-static_assert(offsetof(Weapon, finalizedAttackSensor.resetAttack) == 0x950, "Weapon.finalizedAttackSensor.resetAttack offset mismatch");
-static_assert(sizeof(Weapon) == 0xB5C, "Weapon size mismatch");
+BVR_SIZE_CHECK(offsetof(Weapon, setupAttackSensor.resetAttack) == 0x8A0, "Weapon.setupAttackSensor.resetAttack offset mismatch");
+BVR_SIZE_CHECK(offsetof(Weapon, setupAttackSensor.mode) == 0x874, "Weapon.setupAttackSensor.mode offset mismatch");
+BVR_SIZE_CHECK(offsetof(Weapon, finalizedAttackSensor.resetAttack) == 0x950, "Weapon.finalizedAttackSensor.resetAttack offset mismatch");
+BVR_SIZE_CHECK(sizeof(Weapon) == 0xB5C, "Weapon size mismatch");
 
 struct LookAtMatrix {
     BEVec3 pos;
@@ -511,8 +511,8 @@ struct ActCamera : ActorWiiU {
     PADDED_BYTES(0x588, 0x5BC);
     LookAtMatrix finalCamMtx;
 };
-static_assert(offsetof(ActCamera, origCamMtx) == 0x550, "ActCamera.origCamMtx offset mismatch");
-static_assert(offsetof(ActCamera, finalCamMtx) == 0x5C0, "ActCamera.finalCamMtx offset mismatch");
+BVR_SIZE_CHECK(offsetof(ActCamera, origCamMtx) == 0x550, "ActCamera.origCamMtx offset mismatch");
+BVR_SIZE_CHECK(offsetof(ActCamera, finalCamMtx) == 0x5C0, "ActCamera.finalCamMtx offset mismatch");
 
 struct BESeadCamera {
     BEMatrix34 mtx;
@@ -527,8 +527,8 @@ struct BESeadLookAtCamera : BESeadCamera {
         return pos == other.pos && at == other.at && up == other.up;
     }
 };
-static_assert(sizeof(BESeadCamera) == 0x34, "BESeadCamera size mismatch");
-static_assert(sizeof(BESeadLookAtCamera) == 0x58, "BESeadLookAtCamera size mismatch");
+BVR_SIZE_CHECK(sizeof(BESeadCamera) == 0x34, "BESeadCamera size mismatch");
+BVR_SIZE_CHECK(sizeof(BESeadLookAtCamera) == 0x58, "BESeadLookAtCamera size mismatch");
 
 
 struct UIManagerInnerArray {
@@ -543,11 +543,11 @@ struct UIManager {
     PADDED_BYTES(0x40688, 0x40DD0-0x04);
 };
 
-static_assert(offsetof(UIManager, innerArray) == 0x20, "UIManager.innerArray offset mismatch");
-static_assert(offsetof(UIManager, innerArray.uiPos1) == 0x58, "UIManagerInnerArray.uiPos1 offset mismatch");
-static_assert(offsetof(UIManager, innerArray.uiPos2) == 0x64, "UIManagerInnerArray.uiPos1 offset mismatch");
-static_assert(sizeof(UIManagerInnerArray) == 0x40668, "UIManagerInnerArray size mismatch");
-static_assert(sizeof(UIManager) == 0x40DD0, "UIManager size mismatch");
+BVR_SIZE_CHECK(offsetof(UIManager, innerArray) == 0x20, "UIManager.innerArray offset mismatch");
+BVR_SIZE_CHECK(offsetof(UIManager, innerArray.uiPos1) == 0x58, "UIManagerInnerArray.uiPos1 offset mismatch");
+BVR_SIZE_CHECK(offsetof(UIManager, innerArray.uiPos2) == 0x64, "UIManagerInnerArray.uiPos1 offset mismatch");
+BVR_SIZE_CHECK(sizeof(UIManagerInnerArray) == 0x40668, "UIManagerInnerArray size mismatch");
+BVR_SIZE_CHECK(sizeof(UIManager) == 0x40DD0, "UIManager size mismatch");
 
 // not identical memory layout wise
 struct Frustum {
@@ -656,8 +656,8 @@ struct InlineParamBool {
     BEType<uint32_t> keyPtr;
 };
 
-static_assert(sizeof(InlineParamVec3) == 0x34, "InlineParamVec3 size mismatch");
-static_assert(sizeof(InlineParamBool) == 0x34, "InlineParamBool size mismatch");
+BVR_SIZE_CHECK(sizeof(InlineParamVec3) == 0x34, "InlineParamVec3 size mismatch");
+BVR_SIZE_CHECK(sizeof(InlineParamBool) == 0x34, "InlineParamBool size mismatch");
 
 
 

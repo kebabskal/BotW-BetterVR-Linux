@@ -1,0 +1,15 @@
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/imgui.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/implot.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/edit_cache.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/rebuild_cache.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/list_install_components.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/install.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/install/local.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/CMakeFiles/install/strip.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/CMakeFiles/BetterVR_Layer.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/CMakeFiles/edit_cache.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/CMakeFiles/rebuild_cache.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/CMakeFiles/list_install_components.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/CMakeFiles/install.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/CMakeFiles/install/local.dir
+/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/CMakeFiles/install/strip.dir

@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/cmake_install.cmake",
+		"/home/hannes/Documents/zelda-vr/BotW-BetterVR/build-linux/src/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

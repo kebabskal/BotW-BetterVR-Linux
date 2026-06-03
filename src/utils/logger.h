@@ -23,6 +23,7 @@ struct std::formatter<VkFormat> : std::formatter<string> {
     }
 };
 
+#if BETTERVR_HAS_D3D12
 template <>
 struct std::formatter<DXGI_FORMAT> : std::formatter<string> {
     auto format(const DXGI_FORMAT format, std::format_context& ctx) const {
@@ -55,6 +56,7 @@ struct std::formatter<DXGI_FORMAT> : std::formatter<string> {
         }
     }
 };
+#endif // BETTERVR_HAS_D3D12
 
 template <>
 struct std::formatter<glm::fmat3> : std::formatter<string> {
@@ -182,6 +184,7 @@ struct std::formatter<LookAtMatrix> : std::formatter<string> {
 };
 
 
+#if BETTERVR_HAS_D3D12
 template <>
 struct std::formatter<D3D_FEATURE_LEVEL> : std::formatter<string> {
     auto format(const D3D_FEATURE_LEVEL featureLevel, std::format_context& ctx) const {
@@ -212,6 +215,7 @@ struct std::formatter<D3D_FEATURE_LEVEL> : std::formatter<string> {
         return std::format_to(ctx.out(), "{:X}", std::to_underlying(featureLevel));
     }
 };
+#endif // BETTERVR_HAS_D3D12
 
 static std::string FormatDistance(float distance) {
     float distanceInches = distance * 39.3700787f;
@@ -243,7 +247,7 @@ public:
     Log();
     ~Log();
 
-    template <typename LogType L>
+    template <LogType L>
     static inline bool consteval isLogTypeEnabled() {
         if constexpr (L == ERROR) {
             return true;
@@ -271,7 +275,7 @@ public:
         return false;
     }
 
-    template <typename LogType L>
+    template <LogType L>
     static inline void print(const char* message) {
         if constexpr (!isLogTypeEnabled<L>()) {
             return;
@@ -298,7 +302,7 @@ public:
 #endif
     }
 
-    template <typename LogType L, class... Args>
+    template <LogType L, class... Args>
     static inline void print(const char* format, Args&&... args) {
         if constexpr (!isLogTypeEnabled<L>()) {
             return;

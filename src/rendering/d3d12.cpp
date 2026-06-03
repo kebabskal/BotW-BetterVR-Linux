@@ -1,5 +1,7 @@
 #include "pch.h"
 
+#if BETTERVR_HAS_D3D12
+
 #include "d3d12.h"
 #include "instance.h"
 #include "utils/d3d12_utils.h"
@@ -785,3 +787,5 @@ void RND_D3D12::DebugDrawPipeline::Render(OpenXR::EyeSide side, ID3D12GraphicsCo
 
 template class RND_D3D12::PresentPipeline<false>;
 template class RND_D3D12::PresentPipeline<true>;
+
+#endif // BETTERVR_HAS_D3D12
