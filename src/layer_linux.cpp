@@ -14,6 +14,18 @@
 #include "utils/render_utils.h"
 #include "hud_shaders.h"
 
+// ImGui integration for the HUD quad — minimal port of upstream's
+// RND_Renderer::ImGuiOverlay. Draws ImGui content directly into the HUD
+// quad swapchain via dynamic rendering. This lets us draw HUD elements
+// (and eventually BotW's hearts/stamina from game-memory state) without
+// the magic-clear capture race.
+#ifdef IMGUI_IMPL_VULKAN_USE_VOLK
+#undef IMGUI_IMPL_VULKAN_USE_VOLK
+#endif
+#include "imgui.h"
+// Use the bundled imgui_impl_vulkan.h (the one whose .cpp we compile).
+#include "imgui_impl_vulkan.h"
+
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -1450,6 +1462,9 @@ static VkBoot& GetVkBoot() {
 // Drives the OpenXR session through its state machine, submits solid-color
 // frames until the runtime tells us to stop. This is the Phase 2B "do you see
 // purple in the headset?" milestone.
+static VkInstance       g_ourVkInstance = VK_NULL_HANDLE;
+static VkPhysicalDevice g_xrPhysDev     = VK_NULL_HANDLE;
+
 static void RunFrameLoop(XrInstance xrInstance,
                          XrSystemId xrSystem,
                          XrSession  session,
@@ -1993,6 +2008,103 @@ static void RunFrameLoop(XrInstance xrInstance,
                  (int)hudReady, (void*)hudVert, (void*)hudFrag, (void*)hudPipeline,
                  (void*)hudSrcView[0], (void*)hudSrcView[1]);
 
+    // ── ImGui Vulkan backend init for the HUD quad ──
+    // We render ImGui draw data directly into the HUD quad swapchain via
+    // dynamic rendering. This sidesteps the magic-clear race entirely:
+    // ImGui content is drawn fresh each frame from our own state, not
+    // captured from BotW's framebuffers.
+    bool imguiReady = false;
+    VkDescriptorPool imguiPool = VK_NULL_HANDLE;
+    do {
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: init start (inst=%p physDev=%p)\n",
+                     (void*)g_ourVkInstance, (void*)g_xrPhysDev);
+        if (!hudQuadSwapchain) { std::fprintf(stderr, "[BetterVR-Linux] ImGui: no HUD swapchain\n"); break; }
+        if (!g_ourVkInstance || !g_xrPhysDev) {
+            std::fprintf(stderr, "[BetterVR-Linux] ImGui: instance/physDev missing\n");
+            break;
+        }
+        // Descriptor pool large enough for ImGui's needs (fonts + dynamic
+        // textures the BotW HUD might add later).
+        VkDescriptorPoolSize ps[] = {
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64 },
+        };
+        VkDescriptorPoolCreateInfo dpci = {};
+        dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        dpci.maxSets       = 64;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes    = ps;
+        if (dfn.CreateDescriptorPool(device, &dpci, nullptr, &imguiPool) != VK_SUCCESS) {
+            std::fprintf(stderr, "[BetterVR-Linux] ImGui: descriptor pool create failed\n");
+            break;
+        }
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: dpool=%p\n", (void*)imguiPool);
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: ctx created\n");
+        ImGui::StyleColorsDark();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr; // no settings file
+
+        // Loader: ImGui needs Vulkan funcs we haven't resolved. Use the
+        // global vkGetInstanceProcAddr (works for instance + device funcs
+        // via the vkroots dispatch chain).
+        static std::atomic<int> s_missingCount{0};
+        bool loadOk = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3,
+            [](const char* name, void* user) -> PFN_vkVoidFunction {
+                auto* vbp = (VkBoot*)user;
+                if (!vbp || !vbp->GetInstanceProcAddr) return nullptr;
+                PFN_vkVoidFunction fn = vbp->GetInstanceProcAddr(g_ourVkInstance, name);
+                if (!fn) {
+                    if (s_missingCount.fetch_add(1) < 20) {
+                        std::fprintf(stderr, "[BetterVR-Linux] ImGui loader: missing '%s' (stubbing)\n", name);
+                    }
+                    // Stub: ImGui only fails LoadFunctions if any pointer is
+                    // nullptr. Surface/swapchain functions aren't used since
+                    // we drive rendering manually with dynamic rendering, so
+                    // returning a non-null stub keeps LoadFunctions happy.
+                    static auto stub = [](){ }; // address used as dummy fn ptr
+                    return reinterpret_cast<PFN_vkVoidFunction>(+stub);
+                }
+                return fn;
+            },
+            (void*)&vb);
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: LoadFunctions returned %d (missing=%d)\n",
+                     (int)loadOk, s_missingCount.load());
+
+        VkFormat hudColorFormat = (VkFormat)formats[0];
+        VkPipelineRenderingCreateInfoKHR prci = {};
+        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+        prci.colorAttachmentCount    = 1;
+        prci.pColorAttachmentFormats = &hudColorFormat;
+
+        ImGui_ImplVulkan_InitInfo init = {};
+        init.Instance       = g_ourVkInstance;
+        init.PhysicalDevice = g_xrPhysDev;
+        init.Device         = device;
+        init.QueueFamily    = 0;
+        init.Queue          = queue;
+        init.DescriptorPool = imguiPool;
+        init.MinImageCount  = std::max((uint32_t)2, (uint32_t)hudQuadImages.size());
+        init.ImageCount     = (uint32_t)hudQuadImages.size();
+        init.MSAASamples    = VK_SAMPLE_COUNT_1_BIT;
+        init.UseDynamicRendering        = true;
+        init.PipelineRenderingCreateInfo = prci;
+        if (!ImGui_ImplVulkan_Init(&init)) {
+            std::fprintf(stderr, "[BetterVR-Linux] ImGui: ImGui_ImplVulkan_Init failed\n");
+            break;
+        }
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: Init returned ok\n");
+        // CreateFontsTexture is called automatically on first NewFrame.
+        // ImGui needs display size set. We use the HUD quad swapchain size.
+        io.DisplaySize = ImVec2((float)hudQuadW, (float)hudQuadH);
+        io.DeltaTime = 1.0f / 60.0f;
+        imguiReady = true;
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: initialized (display=%ux%u)\n",
+                     hudQuadW, hudQuadH);
+    } while (false);
+
     // ---- 4) Main session loop --------------------------------------------
     XrSessionState state = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
@@ -2499,6 +2611,26 @@ static void RunFrameLoop(XrInstance xrInstance,
                 dfn.CmdPushConstants(cmd, hudPL, VK_SHADER_STAGE_FRAGMENT_BIT,
                                      0, sizeof(pc), pc);
                 dfn.CmdDraw(cmd, 3, 1, 0, 0);
+
+                // ── ImGui draw inside the same dynamic-rendering pass ──
+                if (imguiReady) {
+                    ImGui_ImplVulkan_NewFrame();
+                    ImGui::NewFrame();
+                    // Test content: a window with a label so we can verify
+                    // ImGui is rendering. BotW HUD content will go here.
+                    ImGui::SetNextWindowPos(ImVec2(100, 100));
+                    ImGui::SetNextWindowSize(ImVec2(400, 200));
+                    ImGui::Begin("BetterVR HUD");
+                    ImGui::Text("ImGui in HUD quad layer works!");
+                    ImGui::Text("Frame: %lu", (unsigned long)frameNo);
+                    ImGui::End();
+                    ImGui::Render();
+                    ImDrawData* drawData = ImGui::GetDrawData();
+                    if (drawData) {
+                        ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+                    }
+                }
+
                 dfn.CmdEndRendering(cmd);
 
                 dfn.EndCommandBuffer(cmd);
@@ -2864,6 +2996,8 @@ static void TryCreateOpenXRSession() {
                      (int)r, (void*)session);
 
         if (session != XR_NULL_HANDLE) {
+            g_ourVkInstance = ourVkInstance;
+            g_xrPhysDev     = xrPhysDev;
             RunFrameLoop(xrInstance, xrSystem, session, ourVkDevice, vb);
             xrDestroySession(session);
         }

@@ -14,7 +14,14 @@ if(UNIX AND NOT APPLE)
     # Phase 2A Linux smoke test: build only the minimal layer entry. The full
     # BetterVR rendering pipeline is still tied to D3D12 and needs the OpenXR
     # binding rewrite (Phase 2B) before it can build on Linux.
-    target_sources(BetterVR_Layer PRIVATE ${CMAKE_SOURCE_DIR}/src/layer_linux.cpp)
+    target_sources(BetterVR_Layer PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/layer_linux.cpp
+        ${CMAKE_SOURCE_DIR}/dependencies/imgui_impl_vulkan.cpp)
+    # IMGUI_IMPL_VULKAN_USE_LOADER tells the bundled imgui_impl_vulkan.cpp to
+    # use our ImGui_ImplVulkan_LoadFunctions-supplied loader instead of
+    # calling vkGetInstanceProcAddr directly (which doesn't exist because
+    # IMGUI_IMPL_VULKAN_NO_PROTOTYPES is defined project-wide).
+    target_compile_definitions(BetterVR_Layer PRIVATE IMGUI_IMPL_VULKAN_USE_LOADER)
 else()
 target_sources(BetterVR_Layer PUBLIC
     ${CMAKE_SOURCE_DIR}/src/instance.h
