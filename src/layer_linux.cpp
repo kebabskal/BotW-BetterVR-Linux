@@ -22,8 +22,12 @@
 #ifdef IMGUI_IMPL_VULKAN_USE_VOLK
 #undef IMGUI_IMPL_VULKAN_USE_VOLK
 #endif
+// On Linux we link Vulkan prototypes directly (see src/CMakeLists.txt's
+// -UIMGUI_IMPL_VULKAN_NO_PROTOTYPES + Vulkan::Vulkan link).
+#ifdef IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+#undef IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+#endif
 #include "imgui.h"
-// Use the bundled imgui_impl_vulkan.h (the one whose .cpp we compile).
 #include "imgui_impl_vulkan.h"
 
 #include <cstdio>
@@ -2052,6 +2056,18 @@ static void RunFrameLoop(XrInstance xrInstance,
         ImGui::StyleColorsDark();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr; // no settings file
+        std::fprintf(stderr, "[BetterVR-Linux] ImGui: io.Fonts=%p\n", (void*)io.Fonts);
+        if (io.Fonts) {
+            ImFont* defFont = io.Fonts->AddFontDefault();
+            std::fprintf(stderr, "[BetterVR-Linux] ImGui: AddFontDefault=%p size=%d\n",
+                         (void*)defFont, io.Fonts->Fonts.Size);
+            // Build the texture-data side of the atlas BEFORE we ask Vulkan
+            // to create the GPU texture; GetTexDataAsRGBA32 (called inside
+            // CreateFontsTexture) assumes the atlas is built.
+            io.Fonts->Build();
+            std::fprintf(stderr, "[BetterVR-Linux] ImGui: Fonts.Build done (TexWidth=%d Height=%d)\n",
+                         io.Fonts->TexWidth, io.Fonts->TexHeight);
+        }
 
         // Loader: ImGui needs Vulkan funcs we haven't resolved. Use the
         // global vkGetInstanceProcAddr (works for instance + device funcs
