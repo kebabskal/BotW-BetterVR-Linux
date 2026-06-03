@@ -1079,7 +1079,11 @@ static void SetupSharedImageForEye(int slot, int layer, int eye,
     ici.arrayLayers   = 1;
     ici.samples       = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // Layer 1 (2D HUD) also needs SAMPLED so the OpenXR-side fragment
+    // shader can read it. The memory's usage must match both sides' image
+    // handle usages when imported via OPAQUE_FD.
+    ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                      | (layer == 1 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
     ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -1395,7 +1399,11 @@ static void RunFrameLoop(XrInstance xrInstance,
         ici.arrayLayers   = 1;
         ici.samples       = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        // Layer 1 (2D HUD) is sampled by the HUD overlay fragment shader,
+        // so its imported VkImage handle needs VK_IMAGE_USAGE_SAMPLED_BIT.
+        // Without it, descriptor binds silently return 0 from the sampler.
+        ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                          | (layer == 1 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
         ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -1542,6 +1550,48 @@ static void RunFrameLoop(XrInstance xrInstance,
     swInfo.width  = viewCfgs[0].recommendedImageRectWidth;
     swInfo.height = viewCfgs[0].recommendedImageRectHeight;
 
+    // ── HUD quad swapchain ──
+    // Upstream submits the captured 2D layer as a separate XrCompositionLayerQuad
+    // (a floating quad layer in front of the user) with alpha. The runtime
+    // composites it on top of the 3D projection. We do the same: render the
+    // captured 2D image into this swapchain via a fragment shader that writes
+    // alpha=0 for magic-clear pixels (transparent) and alpha=1 for HUD pixels.
+    XrSwapchain hudQuadSwapchain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageVulkanKHR> hudQuadImages;
+    std::vector<VkImageView> hudQuadImageViews;
+    uint32_t hudQuadW = 1024, hudQuadH = 1024;
+    {
+        XrSwapchainCreateInfo si = swInfoTpl;
+        si.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT
+                      | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        si.width  = hudQuadW;
+        si.height = hudQuadH;
+        si.format = formats[0]; // same as projection — guaranteed to have alpha
+        XrResult r = xrCreateSwapchain(session, &si, &hudQuadSwapchain);
+        if (XR_FAILED(r)) {
+            std::fprintf(stderr, "[BetterVR-Linux] HUD quad swapchain create failed: %d\n", (int)r);
+        } else {
+            uint32_t imageCount = 0;
+            xrEnumerateSwapchainImages(hudQuadSwapchain, 0, &imageCount, nullptr);
+            hudQuadImages.resize(imageCount);
+            for (auto& i : hudQuadImages) i.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+            xrEnumerateSwapchainImages(hudQuadSwapchain, imageCount, &imageCount,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(hudQuadImages.data()));
+            hudQuadImageViews.resize(imageCount, VK_NULL_HANDLE);
+            for (uint32_t i = 0; i < imageCount; ++i) {
+                VkImageViewCreateInfo ivci = {};
+                ivci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                ivci.image    = hudQuadImages[i].image;
+                ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                ivci.format   = (VkFormat)formats[0];
+                ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                dfn.CreateImageView(device, &ivci, nullptr, &hudQuadImageViews[i]);
+            }
+            std::fprintf(stderr, "[BetterVR-Linux] HUD quad swapchain: %u images %ux%u\n",
+                         imageCount, hudQuadW, hudQuadH);
+        }
+    }
+
     // ---- 3) Reference space (LOCAL — eye-level, fixed at session start) --
     XrReferenceSpaceCreateInfo rsci = {};
     rsci.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
@@ -1591,8 +1641,12 @@ static void RunFrameLoop(XrInstance xrInstance,
 
         VkSamplerCreateInfo sci = {};
         sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sci.magFilter    = VK_FILTER_LINEAR;
-        sci.minFilter    = VK_FILTER_LINEAR;
+        // NEAREST so we get exact texel values for the discard test —
+        // LINEAR interpolation at HUD-vs-magic boundaries was producing
+        // intermediate colors that fell outside the discard tolerance,
+        // letting magic-clear pixels through.
+        sci.magFilter    = VK_FILTER_NEAREST;
+        sci.minFilter    = VK_FILTER_NEAREST;
         sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -1985,11 +2039,8 @@ static void RunFrameLoop(XrInstance xrInstance,
                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                                        0, nullptr, 0, nullptr, 1, &toShader);
 
-                // HUD overlay: sample the captured 2D image and discard
-                // magic-clear pixels so the 3D scene shows through. The
-                // swapchain is now in COLOR_ATTACHMENT_OPTIMAL, ideal for
-                // dynamic rendering loadOp=LOAD.
-                // BVR_HUD=0 disables the HUD draw entirely (for A/B debugging).
+                // HUD overlay on projection layer (legacy). Re-enable via
+                // BVR_HUD=1 for the shader-discard test.
                 static const bool kHudEnabled = [](){
                     const char* v = std::getenv("BVR_HUD");
                     bool on = !(v && v[0] == '0');
@@ -2002,6 +2053,34 @@ static void RunFrameLoop(XrInstance xrInstance,
                     VkRenderingAttachmentInfo cai = {};
                     cai.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
                     cai.imageView   = eyeImageViews[eye][imgIdx];
+                    // Transition the imported 2D image to GENERAL — without
+                    // this our XR-side VkImage handle's layout stays UNDEFINED
+                    // (its initialLayout), even though the backing memory is
+                    // valid (written by Cemu via its own VkImage handle).
+                    // Sampling an UNDEFINED-layout image returns black.
+                    {
+                        // Descriptor points at slot 0's 2D image (per the
+                        // setup at FrameLoop init), so transition THAT
+                        // image's layout. TODO: per-frame UpdateDescriptorSets
+                        // to point at the picked slot.
+                        VkImage src2D = importedImages[0][1][srcEye];
+                        if (src2D != VK_NULL_HANDLE) {
+                            VkImageMemoryBarrier toGeneral = {};
+                            toGeneral.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                            toGeneral.srcAccessMask = 0;
+                            toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                            toGeneral.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+                            toGeneral.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+                            toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            toGeneral.image         = src2D;
+                            toGeneral.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                            dfn.CmdPipelineBarrier(cmd,
+                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                                0, nullptr, 0, nullptr, 1, &toGeneral);
+                        }
+                    }
                     cai.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                     cai.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
                     cai.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2038,9 +2117,19 @@ static void RunFrameLoop(XrInstance xrInstance,
                     // 2D right. We use the SAME pair regardless of eye so
                     // the shader matches whichever side the captured image
                     // came from (covers BVR_SWAP_EYES too).
+                    // BVR_HUD_TOL = magic-clear discard tolerance (default
+                    // 0.06). Higher catches more pixels including
+                    // anti-aliased borders; lower preserves more HUD
+                    // content. With 1.0 every pixel discards.
+                    static const float kTol = [](){
+                        const char* v = std::getenv("BVR_HUD_TOL");
+                        float t = v ? (float)atof(v) : 0.06f;
+                        std::fprintf(stderr, "[BetterVR-Linux] HudTol=%.3f\n", t);
+                        return t;
+                    }();
                     float pc[8] = {
-                        0.0625f, 0.123f, 0.987f, 0.06f,   // magicA + tolerance
-                        0.0625f, 0.987f, 0.123f, 0.0f,    // magicB
+                        0.0625f, 0.123f, 0.987f, kTol,
+                        0.0625f, 0.987f, 0.123f, 0.0f,
                     };
                     dfn.CmdPushConstants(cmd, hudPL, VK_SHADER_STAGE_FRAGMENT_BIT,
                                          0, sizeof(pc), pc);
@@ -2118,6 +2207,119 @@ static void RunFrameLoop(XrInstance xrInstance,
             // Only reset if we actually had a fully-complete slot to submit —
             // otherwise we'd lose partial captures from BotW.
             if (submitSlot >= 0) SlotReset(submitSlot);
+        }
+
+        // ── HUD quad layer render ──
+        // Render slot 0's left-eye 2D capture into the HUD quad swapchain
+        // via the existing pipeline+shader (writes alpha=0 for magic pixels,
+        // alpha=1 for HUD pixels). Submitted as XrCompositionLayerQuad
+        // after the projection layer — runtime alpha-blends it on top.
+        XrCompositionLayerQuad hudQuadLayer = {};
+        bool hudQuadReady = false;
+        if (fs.shouldRender && hudQuadSwapchain != XR_NULL_HANDLE
+            && hudReady && hudDS[0] != VK_NULL_HANDLE
+            && importedImages[0][1][0] != VK_NULL_HANDLE) {
+            uint32_t imgIdx = 0;
+            XrSwapchainImageAcquireInfo sai = {}; sai.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+            xrAcquireSwapchainImage(hudQuadSwapchain, &sai, &imgIdx);
+            XrSwapchainImageWaitInfo swi = {}; swi.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+            swi.timeout = XR_INFINITE_DURATION;
+            xrWaitSwapchainImage(hudQuadSwapchain, &swi);
+
+            if (imgIdx < hudQuadImageViews.size()) {
+                VkImage qImg = hudQuadImages[imgIdx].image;
+                VkImageView qView = hudQuadImageViews[imgIdx];
+                dfn.ResetCommandBuffer(cmd, 0);
+                VkCommandBufferBeginInfo cbbi = {};
+                cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                dfn.BeginCommandBuffer(cmd, &cbbi);
+
+                VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+                // Quad swapchain: UNDEFINED → COLOR_ATTACHMENT_OPTIMAL
+                VkImageMemoryBarrier toCA = {};
+                toCA.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                toCA.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                toCA.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+                toCA.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                toCA.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toCA.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toCA.image         = qImg;
+                toCA.subresourceRange = range;
+                dfn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                    0, nullptr, 0, nullptr, 1, &toCA);
+
+                // Source 2D image → GENERAL for sampling
+                VkImageMemoryBarrier toGen = {};
+                toGen.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                toGen.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                toGen.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+                toGen.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+                toGen.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toGen.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toGen.image         = importedImages[0][1][0];
+                toGen.subresourceRange = range;
+                dfn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                    0, nullptr, 0, nullptr, 1, &toGen);
+
+                VkRenderingAttachmentInfo cai = {};
+                cai.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                cai.imageView   = qView;
+                cai.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                cai.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                cai.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+                cai.clearValue.color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                VkRenderingInfo ri = {};
+                ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                ri.renderArea           = { { 0, 0 }, { hudQuadW, hudQuadH } };
+                ri.layerCount           = 1;
+                ri.colorAttachmentCount = 1;
+                ri.pColorAttachments    = &cai;
+                dfn.CmdBeginRendering(cmd, &ri);
+
+                VkViewport vp = { 0.0f, 0.0f, (float)hudQuadW, (float)hudQuadH, 0.0f, 1.0f };
+                dfn.CmdSetViewport(cmd, 0, 1, &vp);
+                VkRect2D sc = { { 0, 0 }, { hudQuadW, hudQuadH } };
+                dfn.CmdSetScissor(cmd, 0, 1, &sc);
+                dfn.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hudPipeline);
+                dfn.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                          hudPL, 0, 1, &hudDS[0], 0, nullptr);
+                float pc[8] = {
+                    0.0625f, 0.123f, 0.987f, 0.1f,
+                    0.0625f, 0.987f, 0.123f, 0.0f,
+                };
+                dfn.CmdPushConstants(cmd, hudPL, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                     0, sizeof(pc), pc);
+                dfn.CmdDraw(cmd, 3, 1, 0, 0);
+                dfn.CmdEndRendering(cmd);
+
+                dfn.EndCommandBuffer(cmd);
+                VkSubmitInfo si = {};
+                si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers    = &cmd;
+                dfn.QueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                dfn.DeviceWaitIdle(device);
+
+                XrSwapchainImageReleaseInfo sri = {};
+                sri.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+                xrReleaseSwapchainImage(hudQuadSwapchain, &sri);
+
+                // Build the quad layer pose: 1 m in front of the user, 1×0.56m
+                hudQuadLayer.type            = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                hudQuadLayer.layerFlags      = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                hudQuadLayer.space           = localSpace;
+                hudQuadLayer.eyeVisibility   = XR_EYE_VISIBILITY_BOTH;
+                hudQuadLayer.subImage.swapchain       = hudQuadSwapchain;
+                hudQuadLayer.subImage.imageRect       = { { 0, 0 }, { (int32_t)hudQuadW, (int32_t)hudQuadH } };
+                hudQuadLayer.subImage.imageArrayIndex = 0;
+                hudQuadLayer.pose            = { { 0, 0, 0, 1 }, { 0.0f, 0.0f, -1.0f } };
+                hudQuadLayer.size            = { 1.0f, 0.5625f };
+                hudQuadReady = true;
+            }
         }
 
         // Unused stub left over from the old quad path — kept to minimize
@@ -2237,11 +2439,14 @@ static void RunFrameLoop(XrInstance xrInstance,
         fei.type                 = XR_TYPE_FRAME_END_INFO;
         fei.displayTime          = fs.predictedDisplayTime;
         fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        const XrCompositionLayerBaseHeader* layers[] = {
-            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer)
-        };
+        const XrCompositionLayerBaseHeader* layers[2] = { nullptr, nullptr };
+        uint32_t layerCount = 0;
         if (fs.shouldRender) {
-            fei.layerCount = 1;
+            layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer);
+            if (hudQuadReady) {
+                layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hudQuadLayer);
+            }
+            fei.layerCount = layerCount;
             fei.layers     = layers;
         }
         xrEndFrame(session, &fei);
@@ -2637,6 +2842,10 @@ public:
         // captured swapchain images, blit it into the shared image so the
         // OpenXR side picks it up next frame.
         CopyPresentToSharedIfReady(presentInfo);
+        // Reverse path: blit our captured 3D content INTO the present image
+        // so the Cemu window shows the same thing the headset shows. Useful
+        // for iterating on capture/HUD work without putting on the headset.
+        BlitCapturedToCemuWindow(presentInfo);
 
         return pDispatch.QueuePresentKHR(queue, presentInfo);
     }
@@ -2758,6 +2967,13 @@ public:
         // images (g_eyeImages[slot][0][eye] = 3D, g_eyeImages[slot][1][eye] = 2D).
         int magicLayer = (raw >= 10) ? 0 : (raw >= 0 ? 1 : -1);
         int magicEye   = (raw >= 0) ? (raw % 10) : -1;
+        // patch_RND_Find2DFrameBuffer's clear2DColorBuffer uses INVERTED
+        // eye-side logic vs the 3D find-buffer (compare `beq leftEye2DValues`
+        // in the 2D asm with `beq leftEye3DValues` in the 3D asm — the
+        // `cmpwi r3, 1` is the inversion). So a 2D clear that we classify
+        // by color as "right magic" actually belongs to the LEFT eye's
+        // 2D buffer. Flip the routing for the 2D layer.
+        if (magicLayer == 1 && magicEye >= 0) magicEye = 1 - magicEye;
         // Ring-buffer slot encoded in the alpha channel by the BetterVR
         // PPC patch (currentFrameCounter, alternates 0/1 per BotW frame).
         // This makes each slot atomically owned by either BotW (writer) or
@@ -3101,6 +3317,7 @@ public:
 
 private:
     static void CopyPresentToSharedIfReady(const VkPresentInfoKHR* presentInfo);
+    static void BlitCapturedToCemuWindow(const VkPresentInfoKHR* presentInfo);
     static void InjectPerEyeCopy(const vkroots::VkCommandBufferDispatch& dd, VkCommandBuffer cb, int eye);
     static void InjectPreClearCapture(const vkroots::VkCommandBufferDispatch& dd,
                                       VkCommandBuffer cb, VkImage src,
@@ -3368,6 +3585,110 @@ void VkDeviceOverrides::CopyPresentToSharedIfReady(const VkPresentInfoKHR* prese
     pc.dd->DeviceWaitIdle(pc.device);
     g_hookState.presentBlits.fetch_add(1, std::memory_order_relaxed);
 #endif
+}
+
+// Reverse of CopyPresentToSharedIfReady: blit our captured 3D content
+// back INTO Cemu's swapchain image just before the present. The Cemu
+// window then shows what the headset would show (no XR), which makes
+// iteration on capture/compositing much faster than putting on the
+// headset for each test.
+// BVR_CEMU_WINDOW=0 disables.
+void VkDeviceOverrides::BlitCapturedToCemuWindow(const VkPresentInfoKHR* presentInfo) {
+    static const bool kEnabled = [](){
+        const char* v = std::getenv("BVR_CEMU_WINDOW");
+        bool on = !(v && v[0] == '0');
+        std::fprintf(stderr, "[BetterVR-Linux] CemuWindowBlit=%d\n", (int)on);
+        return on;
+    }();
+    if (!kEnabled || !presentInfo || presentInfo->swapchainCount == 0) return;
+
+    CemuSwapchain swap;
+    SharedImage   src3D;
+    CapturedHandles h;
+    {
+        std::lock_guard<std::mutex> lock(g_handlesMutex);
+        swap   = g_cemuSwap;
+        // Pick slot 0's left-eye 3D capture. Mono is fine for the Cemu window.
+        src3D  = g_eyeImages[0][0][0];
+        h      = g_handles;
+    }
+    if (src3D.cemuImage == VK_NULL_HANDLE) return;
+    if (swap.handle == VK_NULL_HANDLE || swap.images.empty()) return;
+    if (presentInfo->pSwapchains[0] != swap.handle) return;
+    const uint32_t imgIdx = presentInfo->pImageIndices[0];
+    if (imgIdx >= swap.images.size()) return;
+    VkImage dstImage = swap.images[imgIdx];
+
+    thread_local PresentCopyResources pc;
+    if (!pc.ok) {
+        pc.dd     = vkroots::tables::DeviceDispatches.find(h.device);
+        pc.device = h.device;
+        if (!pc.dd) return;
+        pc.dd->GetDeviceQueue(h.device, h.graphicsQueueFamily, 0, &pc.queue);
+        VkCommandPoolCreateInfo cpci = {};
+        cpci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = h.graphicsQueueFamily;
+        if (pc.dd->CreateCommandPool(h.device, &cpci, nullptr, &pc.pool) != VK_SUCCESS) return;
+        VkCommandBufferAllocateInfo cbai = {};
+        cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool        = pc.pool;
+        cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        if (pc.dd->AllocateCommandBuffers(h.device, &cbai, &pc.cmd) != VK_SUCCESS) return;
+        pc.ok = true;
+        std::fprintf(stderr, "[BetterVR-Linux] CemuWindowBlit: cmd resources ready\n");
+    }
+
+    pc.dd->ResetCommandBuffer(pc.cmd, 0);
+    VkCommandBufferBeginInfo cbbi = {};
+    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pc.dd->BeginCommandBuffer(pc.cmd, &cbbi);
+    VkImageSubresourceRange one = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    // Cemu swap image: PRESENT_SRC_KHR (or UNDEFINED on first use) → TRANSFER_DST_OPTIMAL
+    VkImageMemoryBarrier b1 = {};
+    b1.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b1.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT;
+    b1.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b1.oldLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b1.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b1.image               = dstImage;
+    b1.subresourceRange    = one;
+    pc.dd->CmdPipelineBarrier(pc.cmd,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        0, nullptr, 0, nullptr, 1, &b1);
+
+    VkImageBlit blit = {};
+    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.srcOffsets[1]  = { (int32_t)src3D.width, (int32_t)src3D.height, 1 };
+    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.dstOffsets[1]  = { (int32_t)swap.width, (int32_t)swap.height, 1 };
+    pc.dd->CmdBlitImage(pc.cmd,
+        src3D.cemuImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        dstImage,        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit, VK_FILTER_LINEAR);
+
+    // Restore PRESENT_SRC_KHR so the present command after us doesn't trip.
+    VkImageMemoryBarrier b2 = b1;
+    b2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b2.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    b2.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b2.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    pc.dd->CmdPipelineBarrier(pc.cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+        0, nullptr, 0, nullptr, 1, &b2);
+
+    pc.dd->EndCommandBuffer(pc.cmd);
+    VkSubmitInfo si = {};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &pc.cmd;
+    pc.dd->QueueSubmit(pc.queue, 1, &si, VK_NULL_HANDLE);
+    pc.dd->DeviceWaitIdle(pc.device);
 }
 
 // Injected into Cemu's command buffer at vkCmdEndRendering / EndRenderPass.
