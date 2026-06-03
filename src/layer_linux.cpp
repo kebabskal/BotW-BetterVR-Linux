@@ -1936,14 +1936,15 @@ static void RunFrameLoop(XrInstance xrInstance,
         // proper port would create views for all (slot, eye) combos and
         // pick at draw time. The HUD draw is disabled (BVR_HUD=0) until
         // the ring-buffer 3D side is verified stable.
+        // BVR_HUD_FROM_PRESENT=1 (default) routes HUD quad to the Cemu
+        // present image; =0 routes to the 2D-buffer capture.
+        const bool kUsePresent = !(std::getenv("BVR_HUD_FROM_PRESENT") &&
+                                   std::getenv("BVR_HUD_FROM_PRESENT")[0] == '0');
         for (int eye = 0; eye < 2; ++eye) {
-            // Prefer the Cemu-present image (contains full BotW output incl
-            // HUD) when available; fall back to the 2D capture (often only
-            // magic clear) otherwise.
-            VkImage src2D = (importedPresentImage != VK_NULL_HANDLE)
+            VkImage src2D = (kUsePresent && importedPresentImage != VK_NULL_HANDLE)
                           ? importedPresentImage
                           : importedImages[0][1][eye];
-            VkFormat srcFormat = (importedPresentImage != VK_NULL_HANDLE)
+            VkFormat srcFormat = (kUsePresent && importedPresentImage != VK_NULL_HANDLE)
                           ? presentShared.format
                           : shareds[0][1][eye].format;
             if (src2D == VK_NULL_HANDLE) continue;
@@ -2390,7 +2391,9 @@ static void RunFrameLoop(XrInstance xrInstance,
         // after the projection layer — runtime alpha-blends it on top.
         XrCompositionLayerQuad hudQuadLayer = {};
         bool hudQuadReady = false;
-        VkImage hudSampledImage = (importedPresentImage != VK_NULL_HANDLE)
+        static const bool kHudUsePresent = !(std::getenv("BVR_HUD_FROM_PRESENT") &&
+                                             std::getenv("BVR_HUD_FROM_PRESENT")[0] == '0');
+        VkImage hudSampledImage = (kHudUsePresent && importedPresentImage != VK_NULL_HANDLE)
                                 ? importedPresentImage
                                 : importedImages[0][1][0];
         if (fs.shouldRender && hudQuadSwapchain != XR_NULL_HANDLE
