@@ -3,6 +3,12 @@
 #include "instance.h"
 #include <cstring>
 
+// Defined in hooking/framebuffer.cpp at global scope; captured here from the
+// CreateDevice hook so the Cemu-window mirror can lazy-create a command pool.
+// (Declared at file scope so the name resolves to the global namespace —
+// inside a `VRLayer::Method()` body the enclosing namespace is VRLayer.)
+extern uint32_t g_cemuMirrorGraphicsQueueFamily;
+
 #ifdef _DEBUG
 static VkInstance s_debugMessengerInstance = VK_NULL_HANDLE;
 static VkDebugUtilsMessengerEXT s_debugMessenger = VK_NULL_HANDLE;
@@ -381,6 +387,17 @@ VkResult VRLayer::VkInstanceOverrides::CreateDevice(const vkroots::VkPhysicalDev
     if (result != VK_SUCCESS) {
         Log::print<ERROR>("Failed to create Vulkan device! Error {}", result);
         return result;
+    }
+
+    // Capture Cemu's first graphics-capable queue family so the Cemu-window
+    // mirror in framebuffer.cpp can lazy-create its command pool.
+    for (uint32_t i = 0; i < modifiedCreateInfo.queueCreateInfoCount; i++) {
+        const auto& qci = modifiedCreateInfo.pQueueCreateInfos[i];
+        if (qci.queueFamilyIndex < queueFamilies.size() &&
+            (queueFamilies[qci.queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+            ::g_cemuMirrorGraphicsQueueFamily = qci.queueFamilyIndex;
+            break;
+        }
     }
 
     // Initialize VRManager late if neither vkEnumeratePhysicalDevices and vkGetPhysicalDeviceProperties were called and used to filter the device

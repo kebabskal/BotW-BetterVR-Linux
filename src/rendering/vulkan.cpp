@@ -3,6 +3,14 @@
 #include "instance.h"
 #include "utils/logger.h"
 
+// Defined at global scope in hooking/framebuffer.cpp. Declared at file scope
+// here (not inside a VRLayer::Method body) so the symbol resolves globally —
+// otherwise the unqualified declaration would be interpreted as a member of
+// the enclosing namespace and the loader would reject our .so with an
+// undefined VRLayer::RegisterCemuSwapchain symbol.
+void RegisterCemuSwapchain(const vkroots::VkDeviceDispatch& pDispatch, VkDevice device,
+                           VkSwapchainKHR swapchain, const VkSwapchainCreateInfoKHR* pCreateInfo);
+
 RND_Vulkan::RND_Vulkan(VkInstance vkInstance, VkPhysicalDevice vkPhysDevice, VkDevice vkDevice): m_instance(vkInstance), m_physicalDevice(vkPhysDevice), m_device(vkDevice) {
     m_instanceDispatch = vkroots::tables::InstanceDispatches.find(vkInstance);
     m_physicalDeviceDispatch = vkroots::tables::PhysicalDeviceDispatches.find(vkPhysDevice);
@@ -79,5 +87,11 @@ VkResult VRLayer::VkDeviceOverrides::GetPhysicalDeviceSurfacePresentModesKHR(con
 }
 
 VkResult VRLayer::VkDeviceOverrides::CreateSwapchainKHR(const vkroots::VkDeviceDispatch& pDispatch, VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain) {
-    return pDispatch.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    VkResult res = pDispatch.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if (res == VK_SUCCESS) {
+        // Track Cemu's swapchains so the mirror in framebuffer.cpp can find
+        // VkImages by swapchain handle + present-index in vkQueuePresentKHR.
+        ::RegisterCemuSwapchain(pDispatch, device, *pSwapchain, pCreateInfo);
+    }
+    return res;
 }

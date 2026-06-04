@@ -3,6 +3,7 @@
 #include "framebuffer.h"
 #include "instance.h"
 #include "layer.h"
+#include "rendering/texture.h"
 #include "utils/vulkan_utils.h"
 #include "utils/debug_draw.h"
 #include "utils/render_utils.h"
@@ -16,6 +17,82 @@ std::vector<std::pair<VkCommandBuffer, SharedTexture*>> s_activeCopyOperations;
 
 VkImage s_curr3DColorImage = VK_NULL_HANDLE;
 VkImage s_curr3DDepthImage = VK_NULL_HANDLE;
+
+// ===================================================================== //
+// Cemu-window mirror: blit our captured 3D left-eye frame into Cemu's own
+// swapchain image right before vkQueuePresentKHR. Without this, BetterVR's
+// magic-color clears leave Cemu's window stamped with magenta/cyan instead
+// of game content, so we can't iterate without the headset on.
+//
+// Toggle: BVR_CEMU_WINDOW=0 disables (default on).
+// ===================================================================== //
+uint32_t g_cemuMirrorGraphicsQueueFamily = UINT32_MAX; // set by layer.cpp CreateDevice
+
+namespace CemuMirror {
+    struct SwapInfo {
+        std::vector<VkImage> images;
+        VkExtent2D extent;
+        VkFormat format;
+    };
+    std::mutex g_mtx;
+    std::unordered_map<VkSwapchainKHR, SwapInfo> g_swaps;
+
+    // Long-lived blit resources on Cemu's device (lazy-created).
+    VkDevice g_device = VK_NULL_HANDLE;
+    const vkroots::VkDeviceDispatch* g_dispatch = nullptr;
+    VkCommandPool g_cmdPool = VK_NULL_HANDLE;
+    VkCommandBuffer g_cmdBuffer = VK_NULL_HANDLE;
+    VkFence g_fence = VK_NULL_HANDLE;
+
+    bool MirrorEnabled() {
+        static const bool e = []{
+            const char* v = std::getenv("BVR_CEMU_WINDOW");
+            return !v || v[0] != '0';
+        }();
+        return e;
+    }
+
+    bool EnsureBlitResources(const vkroots::VkDeviceDispatch& pDispatch, VkDevice device) {
+        if (g_cmdPool != VK_NULL_HANDLE) return true;
+        if (g_cemuMirrorGraphicsQueueFamily == UINT32_MAX) return false;
+        g_device = device;
+        g_dispatch = &pDispatch;
+        VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.queueFamilyIndex = g_cemuMirrorGraphicsQueueFamily;
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        if (pDispatch.CreateCommandPool(device, &pci, nullptr, &g_cmdPool) != VK_SUCCESS) return false;
+        VkCommandBufferAllocateInfo abi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        abi.commandPool = g_cmdPool;
+        abi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        abi.commandBufferCount = 1;
+        if (pDispatch.AllocateCommandBuffers(device, &abi, &g_cmdBuffer) != VK_SUCCESS) return false;
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        // SIGNALED so the first WaitForFences returns immediately — otherwise
+        // we deadlock the present thread on a fence nothing has yet submitted.
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (pDispatch.CreateFence(device, &fci, nullptr, &g_fence) != VK_SUCCESS) return false;
+        return true;
+    }
+}
+
+// Called from vulkan.cpp's CreateSwapchainKHR after the real create succeeds.
+void RegisterCemuSwapchain(const vkroots::VkDeviceDispatch& pDispatch, VkDevice device,
+                           VkSwapchainKHR swapchain, const VkSwapchainCreateInfoKHR* pCreateInfo) {
+    uint32_t count = 0;
+    pDispatch.GetSwapchainImagesKHR(device, swapchain, &count, nullptr);
+    std::vector<VkImage> images(count);
+    pDispatch.GetSwapchainImagesKHR(device, swapchain, &count, images.data());
+
+    CemuMirror::SwapInfo info{};
+    info.images = std::move(images);
+    info.extent = pCreateInfo->imageExtent;
+    info.format = pCreateInfo->imageFormat;
+
+    std::lock_guard lk(CemuMirror::g_mtx);
+    CemuMirror::g_swaps[swapchain] = std::move(info);
+    Log::print<INFO>("[BVR-mirror] Registered Cemu swapchain {} ({}x{} fmt={}) with {} images",
+        (void*)swapchain, info.extent.width, info.extent.height, (int)info.format, info.images.size());
+}
 
 using namespace VRLayer;
 
@@ -538,8 +615,125 @@ VkResult VkDeviceOverrides::QueueSubmit(const vkroots::VkQueueDispatch& pDispatc
     return result;
 }
 
+// Blit the most recent fully-captured 3D-LEFT eye texture into each of the
+// swapchain images about to be presented. Done synchronously (own fence wait)
+// before forwarding the real vkQueuePresentKHR. Slow but simple; matches the
+// Phase 2 approach that the user already validated.
+static void MirrorCapturedToCemuPresent(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
+    using namespace CemuMirror;
+    if (!MirrorEnabled()) return;
+
+    auto* renderer = VRManager::instance().XR->GetRenderer();
+    if (!renderer || !renderer->m_layer3D) return;
+
+    // Pick a slot with a complete LEFT-eye 3D capture.
+    SharedTexture* mirrorSrc = nullptr;
+    VkExtent2D srcExtent{0, 0};
+    for (long fi = 0; fi < 2; ++fi) {
+        if (renderer->GetFrame(fi).copiedColor[OpenXR::EyeSide::LEFT]) {
+            auto& tex = renderer->m_layer3D->GetSharedTextures()[OpenXR::EyeSide::LEFT][fi];
+            if (tex && tex->GetImage() != VK_NULL_HANDLE) {
+                mirrorSrc = tex.get();
+                srcExtent = { tex->GetWidth(), tex->GetHeight() };
+                break;
+            }
+        }
+    }
+    if (!mirrorSrc) return;
+
+    auto* vk = VRManager::instance().VK.get();
+    if (!vk) return;
+    const auto* disp = vk->GetDeviceDispatch();
+    if (!disp) return;
+    if (!EnsureBlitResources(*disp, vk->GetDevice())) return;
+
+    disp->WaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
+    disp->ResetFences(g_device, 1, &g_fence);
+    disp->ResetCommandBuffer(g_cmdBuffer, 0);
+
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    disp->BeginCommandBuffer(g_cmdBuffer, &bi);
+
+    // Source: SharedTexture's Cemu-side VkImage (already in VK_IMAGE_LAYOUT_GENERAL).
+    VkImage srcImage = mirrorSrc->GetImage();
+
+    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+        VkSwapchainKHR sc = pPresentInfo->pSwapchains[i];
+        uint32_t imgIdx = pPresentInfo->pImageIndices[i];
+
+        VkImage dstImage = VK_NULL_HANDLE;
+        VkExtent2D dstExtent{0, 0};
+        {
+            std::lock_guard lk(g_mtx);
+            auto it = g_swaps.find(sc);
+            if (it == g_swaps.end()) continue;
+            if (imgIdx >= it->second.images.size()) continue;
+            dstImage = it->second.images[imgIdx];
+            dstExtent = it->second.extent;
+        }
+        if (dstImage == VK_NULL_HANDLE) continue;
+
+        // Transition dst PRESENT_SRC_KHR -> TRANSFER_DST_OPTIMAL.
+        VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        toDst.srcAccessMask = 0;
+        toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toDst.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.image = dstImage;
+        toDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        disp->CmdPipelineBarrier(g_cmdBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.srcOffsets[0] = { 0, 0, 0 };
+        blit.srcOffsets[1] = { (int32_t)srcExtent.width, (int32_t)srcExtent.height, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.dstOffsets[0] = { 0, 0, 0 };
+        blit.dstOffsets[1] = { (int32_t)dstExtent.width, (int32_t)dstExtent.height, 1 };
+        disp->CmdBlitImage(g_cmdBuffer,
+            srcImage, VK_IMAGE_LAYOUT_GENERAL,
+            dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blit, VK_FILTER_LINEAR);
+
+        // Transition back to PRESENT_SRC_KHR for the upcoming vkQueuePresentKHR.
+        VkImageMemoryBarrier toPresent = toDst;
+        toPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toPresent.dstAccessMask = 0;
+        toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        disp->CmdPipelineBarrier(g_cmdBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toPresent);
+    }
+
+    disp->EndCommandBuffer(g_cmdBuffer);
+
+    // Chain: wait for whatever the present was going to wait on (so Cemu's render
+    // finishes before our blit), signal those same semaphores so the present's
+    // wait still resolves. Since binary semaphores can only be waited once, we
+    // re-signal them after the blit.
+    std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+    si.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+    si.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_cmdBuffer;
+    si.signalSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+    si.pSignalSemaphores = pPresentInfo->pWaitSemaphores;
+    disp->QueueSubmit(queue, 1, &si, g_fence);
+}
+
 VkResult VkDeviceOverrides::QueuePresentKHR(const vkroots::VkQueueDispatch& pDispatch, VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     VRManager::instance().XR->ProcessEvents();
+
+    MirrorCapturedToCemuPresent(queue, pPresentInfo);
 
     auto* renderer = VRManager::instance().XR->GetRenderer();
     {
