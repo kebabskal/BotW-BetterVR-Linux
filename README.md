@@ -39,7 +39,15 @@ git clone --depth 1 --branch v1.91.6 https://github.com/ocornut/imgui.git depend
 git clone --depth 1 --branch v0.16  https://github.com/epezent/implot.git dependencies/implot
 ```
 
-You also need a working **Linux build of Cemu** with two small modifications (so loaded Vulkan layers can `dlsym` Cemu's HLE exports): `DLLEXPORT` defined as `__attribute__((visibility("default")))` on `gameMeta_getTitleId` / `memory_getBase` / `osLib_registerHLEFunction`, and `-rdynamic` on the `CemuBin` link line. See `Cemu/src/CMakeLists.txt` in the parent project.
+You also need a **Linux build of Cemu** with two small modifications so loaded Vulkan layers can `dlsym` Cemu's HLE exports: `DLLEXPORT` defined as `__attribute__((visibility("default")))` on `gameMeta_getTitleId` / `memory_getBase` / `osLib_registerHLEFunction`, and `-rdynamic` on the `CemuBin` link line.
+
+A ready-to-build fork branch with exactly those changes is at [**kebabskal/Cemu @ `linux-export-symbols`**](https://github.com/kebabskal/Cemu/tree/linux-export-symbols) — a single 2-file commit on top of upstream, no behavior changes elsewhere:
+
+```
+git clone -b linux-export-symbols https://github.com/kebabskal/Cemu.git
+cmake -S Cemu -B Cemu/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -G Ninja
+cmake --build Cemu/build -j$(nproc)
+```
 
 An OpenXR runtime — this fork is validated against **[WiVRn](https://github.com/WiVRn/WiVRn)** (flatpak: `io.github.wivrn.wivrn`). Make sure `~/.config/openxr/1/active_runtime.json` is symlinked to its `openxr_wivrn.json`. Other Linux-native runtimes (Monado) should work but aren't tested. **Proton's `wineopenxr.dll` does NOT work** — it expects SteamVR-specific registry values that no non-SteamVR Linux runtime populates (this fork's existence is largely because of that).
 
