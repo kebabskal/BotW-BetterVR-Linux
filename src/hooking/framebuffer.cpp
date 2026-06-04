@@ -22,11 +22,12 @@ using namespace VRLayer;
 VkResult VkDeviceOverrides::CreateImage(const vkroots::VkDeviceDispatch& pDispatch, VkDevice device, const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImage* pImage) {
     VkResult res = pDispatch.CreateImage(device, pCreateInfo, pAllocator, pImage);
 
-    if (pCreateInfo->extent.width >= 1280 && pCreateInfo->extent.height >= 720) {
-        lockImageResolutions.lock();
-        checkAssert(imageResolutions.try_emplace(*pImage, std::make_pair(VkExtent2D{ pCreateInfo->extent.width, pCreateInfo->extent.height }, pCreateInfo->format)).second, "Couldn't insert image resolution into map!");
-        lockImageResolutions.unlock();
-    }
+    // Track every image so the magic-clear hook can look up any candidate's format.
+    // Filtering by >=1280x720 previously dropped BotW's depth-stencil image on Linux,
+    // breaking 3D depth capture and Is3DComplete().
+    lockImageResolutions.lock();
+    imageResolutions.try_emplace(*pImage, std::make_pair(VkExtent2D{ pCreateInfo->extent.width, pCreateInfo->extent.height }, pCreateInfo->format));
+    lockImageResolutions.unlock();
     return res;
 }
 
@@ -68,6 +69,24 @@ void VkDeviceOverrides::CmdClearColorImage(const vkroots::VkCommandBufferDispatc
         side = OpenXR::EyeSide::RIGHT;
     }
 
+    // Diagnostic counters — log every 500 calls.
+    static std::atomic<uint64_t> s_colorL{0}, s_colorR{0}, s_hud{0};
+    {
+        static std::atomic<uint64_t> s_totalClears{0};
+        static std::atomic<uint64_t> s_magicClears{0};
+        const uint64_t total = ++s_totalClears;
+        if (side != (OpenXR::EyeSide)-1) ++s_magicClears;
+        // captureIdx is r * 32 rounded; 0 = 3D, 2 = 2D
+        if (side == OpenXR::EyeSide::LEFT && pColor->float32[0] < 0.05f) ++s_colorL;
+        else if (side == OpenXR::EyeSide::RIGHT && pColor->float32[0] < 0.05f) ++s_colorR;
+        else if (side != (OpenXR::EyeSide)-1 && pColor->float32[0] > 0.05f) ++s_hud;
+        if ((total % 500) == 1) {
+            Log::print<INFO>("[BVR-trace] CmdClearColorImage total={} magic={} 3DL={} 3DR={} 2D={} thisColor=({:.3f},{:.3f},{:.3f},{:.3f})",
+                total, s_magicClears.load(), s_colorL.load(), s_colorR.load(), s_hud.load(),
+                pColor->float32[0], pColor->float32[1], pColor->float32[2], pColor->float32[3]);
+        }
+    }
+
     if (!VRManager::instance().VK) {
         auto* dispatch = pDispatch.pDeviceDispatch;
         VRManager::instance().Init(dispatch->pPhysicalDeviceDispatch->pInstanceDispatch->Instance, dispatch->PhysicalDevice, dispatch->Device);
@@ -79,6 +98,16 @@ void VkDeviceOverrides::CmdClearColorImage(const vkroots::VkCommandBufferDispatc
         const long captureIdx = std::lroundf(pColor->float32[0] * 32.0f);
         const long frameIdx = pColor->float32[3] < 0.5f ? 0 : 1;
         checkAssert(captureIdx == 0 || captureIdx == 2, "Invalid capture index!");
+
+        // BetterVR pack quirk: patch_RND_Find2DFrameBuffer.asm uses INVERTED
+        // eye convention vs Find3DFrameBuffer (cmpwi r3,1 beq leftEye2DValues
+        // — opposite of the 3D patch). So a 2D clear we classify by color as
+        // "right" actually targets the LEFT eye's 2D buffer, and vice versa.
+        // Flip side for captureIdx==2 (HUD/2D) so the LEFT-side capture
+        // branch below (line ~240) actually runs CopyColorToLayer.
+        if (captureIdx == 2) {
+            side = (side == OpenXR::EyeSide::LEFT) ? OpenXR::EyeSide::RIGHT : OpenXR::EyeSide::LEFT;
+        }
 
         Log::print<RENDERING>("[{}] Clearing color image for {} layer for {} side", frameIdx, captureIdx == 0 ? "3D" : "2D", side == OpenXR::EyeSide::LEFT ? "left" : "right");
 
@@ -94,41 +123,55 @@ void VkDeviceOverrides::CmdClearColorImage(const vkroots::VkCommandBufferDispatc
         // initialize the textures of both 2D and 3D layer if either is found since they share the same VkImage and resolution
         if (captureIdx == 0 || captureIdx == 2) {
             if (!layer2D) {
-                lockImageResolutions.lock();
-                if (const auto it = imageResolutions.find(image); it != imageResolutions.end()) {
-                    auto viewConfs = VRManager::instance().XR->GetViewConfigurations();
-
-                    VkExtent2D renderRes = it->second.first;
-                    VkExtent2D swapchainRes = it->second.first;
-                    if (VRManager::instance().XR->m_capabilities.isMetaSimulator) {
-                        swapchainRes = VkExtent2D{ viewConfs[0].recommendedImageRectWidth, viewConfs[0].recommendedImageRectHeight };
+                // Look up the cached resolution under the lock and IMMEDIATELY
+                // release it before constructing the layers. Layer3D ctor →
+                // Swapchain ctor → xrCreateSwapchain re-enters our
+                // VkDeviceOverrides::CreateImage hook (because WiVRn allocates
+                // its own VkImages on the composer device), and that hook also
+                // takes lockImageResolutions. Holding it across construction
+                // would be a self-deadlock on the same thread (std::mutex is
+                // non-recursive).
+                VkExtent2D renderRes;
+                VkFormat foundFormat = VK_FORMAT_UNDEFINED;
+                bool found = false;
+                {
+                    std::lock_guard<std::mutex> lk(lockImageResolutions);
+                    if (const auto it = imageResolutions.find(image); it != imageResolutions.end()) {
+                        renderRes = it->second.first;
+                        foundFormat = it->second.second;
+                        found = true;
                     }
-
-                    renderer->m_gameRenderAspectRatio = (float)renderRes.width / (float)renderRes.height;
-                    layer3D = std::make_unique<RND_Renderer::Layer3D>(renderRes, swapchainRes);
-                    layer2D = std::make_unique<RND_Renderer::Layer2D>(renderRes, swapchainRes);
-                    for (auto& textures : layer3D->GetSharedTextures()) {
-                        for (auto& texture : textures) {
-                            texture->Init(commandBuffer);
-                        }
-                    }
-                    for (auto& textures : layer3D->GetDepthSharedTextures()) {
-                        for (auto& texture : textures) {
-                            texture->Init(commandBuffer);
-                        }
-                    }
-                    for (auto& texture : layer2D->GetSharedTextures()) {
-                        texture->Init(commandBuffer);
-                    }
-
-                    Log::print<INFO>("Found rendering resolution {}x{} @ {} using capture #{}", renderRes.width, renderRes.height, it->second.second, captureIdx);
-                    imguiOverlay = std::make_unique<RND_Renderer::ImGuiOverlay>(commandBuffer, renderRes, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
-                    VRManager::instance().Hooks->m_entityDebugger = std::make_unique<EntityDebugger>();
                 }
-                else {
+                if (!found) {
                     checkAssert(false, "Couldn't find image resolution in map!");
                 }
-                lockImageResolutions.unlock();
+
+                auto viewConfs = VRManager::instance().XR->GetViewConfigurations();
+                VkExtent2D swapchainRes = renderRes;
+                if (VRManager::instance().XR->m_capabilities.isMetaSimulator) {
+                    swapchainRes = VkExtent2D{ viewConfs[0].recommendedImageRectWidth, viewConfs[0].recommendedImageRectHeight };
+                }
+
+                renderer->m_gameRenderAspectRatio = (float)renderRes.width / (float)renderRes.height;
+                layer3D = std::make_unique<RND_Renderer::Layer3D>(renderRes, swapchainRes);
+                layer2D = std::make_unique<RND_Renderer::Layer2D>(renderRes, swapchainRes);
+                for (auto& textures : layer3D->GetSharedTextures()) {
+                    for (auto& texture : textures) {
+                        texture->Init(commandBuffer);
+                    }
+                }
+                for (auto& textures : layer3D->GetDepthSharedTextures()) {
+                    for (auto& texture : textures) {
+                        texture->Init(commandBuffer);
+                    }
+                }
+                for (auto& texture : layer2D->GetSharedTextures()) {
+                    texture->Init(commandBuffer);
+                }
+
+                Log::print<INFO>("Found rendering resolution {}x{} @ {} using capture #{}", renderRes.width, renderRes.height, foundFormat, captureIdx);
+                imguiOverlay = std::make_unique<RND_Renderer::ImGuiOverlay>(commandBuffer, renderRes, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+                VRManager::instance().Hooks->m_entityDebugger = std::make_unique<EntityDebugger>();
             }
         }
 
@@ -156,16 +199,18 @@ void VkDeviceOverrides::CmdClearColorImage(const vkroots::VkCommandBufferDispatc
 
         // 3D layer - color texture for 3D rendering
         if (captureIdx == 0) {
-            // check if the color texture has the appropriate texture format
-            if (s_curr3DColorImage == VK_NULL_HANDLE) {
-                lockImageResolutions.lock();
+            // Re-validate format every call instead of latching the first matching image.
+            // BotW uses multiple 1280x720 A2B10G10R10 framebuffers (one per ring-buffer
+            // slot). The magic clear is fired by BetterVR's PPC patch on the ACTUAL 3D
+            // framebuffer, so we trust `image` as long as the format matches.
+            bool formatOk = false;
+            {
+                std::lock_guard<std::mutex> lk(lockImageResolutions);
                 if (const auto it = imageResolutions.find(image); it != imageResolutions.end()) {
-                    if (it->second.second == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
-                        s_curr3DColorImage = it->first;
-                    }
+                    formatOk = (it->second.second == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
                 }
-                lockImageResolutions.unlock();
             }
+            if (formatOk) s_curr3DColorImage = image;
 
             // don't clear the image if we're in the faux 2D mode
             if (CemuHooks::UseBlackBarsDuringEvents()) {
@@ -173,8 +218,7 @@ void VkDeviceOverrides::CmdClearColorImage(const vkroots::VkCommandBufferDispatc
                 return;
             }
 
-            if (image != s_curr3DColorImage) {
-                Log::print<RENDERING>("Color image is not the same as the current 3D color image! ({} != {})", (void*)image, (void*)s_curr3DColorImage);
+            if (!formatOk) {
                 returnToLayout();
                 return clearFramebuffer(!VRManager::instance().XR->GetRenderer()->IsRendering3D(frameIdx));
             }
@@ -293,6 +337,18 @@ void VkDeviceOverrides::CmdClearDepthStencilImage(const vkroots::VkCommandBuffer
         side = OpenXR::EyeSide::RIGHT;
     }
 
+    // diag counters
+    {
+        static std::atomic<uint64_t> s_total{0}, s_dL{0}, s_dR{0};
+        const uint64_t total = ++s_total;
+        if (side == OpenXR::EyeSide::LEFT) ++s_dL;
+        else if (side == OpenXR::EyeSide::RIGHT) ++s_dR;
+        if ((total % 500) == 1) {
+            Log::print<INFO>("[BVR-trace] CmdClearDepthStencilImage total={} dL={} dR={} thisDepth={:.6f}",
+                total, s_dL.load(), s_dR.load(), pDepthStencil->depth);
+        }
+    }
+
     if (rangeCount == 1 && side != (OpenXR::EyeSide)-1) {
         // stencil value is the frame counter
         const uint32_t frameCounter = pDepthStencil->stencil;
@@ -317,19 +373,19 @@ void VkDeviceOverrides::CmdClearDepthStencilImage(const vkroots::VkCommandBuffer
         };
 
         if (side == OpenXR::EyeSide::LEFT || side == OpenXR::EyeSide::RIGHT) {
-            // 3D layer - depth texture for 3D rendering
-            if (s_curr3DDepthImage == VK_NULL_HANDLE) {
-                lockImageResolutions.lock();
+            // 3D layer - depth texture. Same reasoning as color: re-validate format every
+            // call, don't latch a single image handle. BotW's magic depth clear identifies
+            // the actual depth buffer; multiple per-frame depth images exist.
+            bool formatOk = false;
+            {
+                std::lock_guard<std::mutex> lk(lockImageResolutions);
                 if (const auto it = imageResolutions.find(image); it != imageResolutions.end()) {
-                    if (it->second.second == VK_FORMAT_D32_SFLOAT) {
-                        s_curr3DDepthImage = it->first;
-                    }
+                    formatOk = (it->second.second == VK_FORMAT_D32_SFLOAT);
                 }
-                lockImageResolutions.unlock();
             }
+            if (formatOk) s_curr3DDepthImage = image;
 
-            if (image != s_curr3DDepthImage) {
-                Log::print<RENDERING>("Depth image is not the same as the current 3D depth image! ({} != {})", (void*)image, (void*)s_curr3DDepthImage);
+            if (!formatOk) {
                 returnToLayout();
                 return;
             }
@@ -486,6 +542,17 @@ VkResult VkDeviceOverrides::QueuePresentKHR(const vkroots::VkQueueDispatch& pDis
     VRManager::instance().XR->ProcessEvents();
 
     auto* renderer = VRManager::instance().XR->GetRenderer();
+    {
+        static std::atomic<uint64_t> s_presents{0};
+        static std::atomic<uint64_t> s_framesRun{0};
+        const uint64_t n = ++s_presents;
+        const bool layersReady = renderer && renderer->m_layer3D && renderer->m_layer2D && renderer->m_imguiOverlay;
+        if (layersReady) ++s_framesRun;
+        if ((n % 120) == 1) {
+            Log::print<INFO>("[BVR-trace] QueuePresentKHR n={} renderer={} layersReady={} framesRun={}",
+                n, renderer ? "set" : "null", layersReady ? "y" : "n", s_framesRun.load());
+        }
+    }
     if (renderer && renderer->m_layer3D && renderer->m_layer2D && renderer->m_imguiOverlay) {
         if (renderer->IsInitialized()) {
             renderer->EndFrame();

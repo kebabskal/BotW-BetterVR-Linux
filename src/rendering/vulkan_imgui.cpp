@@ -127,7 +127,30 @@ RND_Renderer::ImGuiOverlay::ImGuiOverlay(VkCommandBuffer cb, VkExtent2D fbRes, V
     ImGui::GetIO().DisplaySize = ImVec2((float)fbRes.width, (float)fbRes.height);
 
     // load vulkan functions
+    //
+    // Linux quirk: instance-level functions (e.g. vkGetPhysicalDeviceMemoryProperties)
+    // returned by GetInstanceProcAddr go through the loader's terminator,
+    // which validates VkPhysicalDevice against its registered list. Since we
+    // hand ImGui the LAYER-side (vkroots-unwrapped) physicalDevice, the loader
+    // rejects it with VUID-...-physicalDevice-parameter and aborts.
+    //
+    // Route the instance-level functions ImGui needs directly through the
+    // vkroots dispatch table — those calls take the layer-side handle and
+    // skip the loader's validation terminator.
     checkAssert(ImGui_ImplVulkan_LoadFunctions(VRManager::instance().vkVersion, [](const char* funcName, void* data_queue) {
+        // Intercepts for instance-level fns whose handles fail loader validation.
+        if (std::strcmp(funcName, "vkGetPhysicalDeviceMemoryProperties") == 0) {
+            static auto wrap = +[](VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties* p) {
+                VRManager::instance().VK->GetPhysicalDeviceDispatch()->GetPhysicalDeviceMemoryProperties(pd, p);
+            };
+            return (PFN_vkVoidFunction)wrap;
+        }
+        if (std::strcmp(funcName, "vkGetPhysicalDeviceProperties") == 0) {
+            static auto wrap = +[](VkPhysicalDevice pd, VkPhysicalDeviceProperties* p) {
+                VRManager::instance().VK->GetPhysicalDeviceDispatch()->GetPhysicalDeviceProperties(pd, p);
+            };
+            return (PFN_vkVoidFunction)wrap;
+        }
         VkInstance instance = VRManager::instance().VK->GetInstance();
         VkDevice device = VRManager::instance().VK->GetDevice();
         PFN_vkVoidFunction addr = VRManager::instance().VK->GetDeviceDispatch()->GetDeviceProcAddr(device, funcName);
@@ -317,6 +340,7 @@ void RND_Renderer::ImGuiOverlay::Update() {
     ImGui::GetIO().FontGlobalScale = 1.0f;
     auto& io = ImGui::GetIO();
 
+#if BETTERVR_HAS_WIN32
     POINT p;
     GetCursorPos(&p);
     ScreenToClient(CemuHooks::m_cemuRenderWindow, &p);
@@ -325,6 +349,14 @@ void RND_Renderer::ImGuiOverlay::Update() {
     GetClientRect(CemuHooks::m_cemuRenderWindow, &rect);
     uint32_t windowWidth = rect.right - rect.left;
     uint32_t windowHeight = rect.bottom - rect.top;
+#else
+    // Linux: desktop ImGui input is driven by the OpenXR controller mapping
+    // (via XR actions). Cemu's window size isn't queried here — we use the
+    // output framebuffer dims directly.
+    struct LinuxPoint { long x = 0, y = 0; } p;
+    uint32_t windowWidth = m_outputRes.width;
+    uint32_t windowHeight = m_outputRes.height;
+#endif
 
     float fbAspect = (float)m_outputRes.width / (float)m_outputRes.height;
 
@@ -362,14 +394,18 @@ void RND_Renderer::ImGuiOverlay::Update() {
     p.x = p.x - blackBarWidth - (LONG)physicalUiRegion.x;
     p.y = p.y - blackBarHeight - (LONG)physicalUiRegion.y;
 
+#if BETTERVR_HAS_WIN32
     bool isWindowFocused = CemuHooks::m_cemuTopWindow == GetForegroundWindow();
     if (isWindowFocused) {
         io.AddMousePosEvent((float)p.x / physicalMenuScale.x, (float)p.y / physicalMenuScale.y);
-
         io.AddMouseButtonEvent(0, GetAsyncKeyState(VK_LBUTTON) & 0x8000);
         io.AddMouseButtonEvent(1, GetAsyncKeyState(VK_RBUTTON) & 0x8000);
         io.AddMouseButtonEvent(2, GetAsyncKeyState(VK_MBUTTON) & 0x8000);
     }
+#else
+    // Linux: input handled by XR actions.
+    bool isWindowFocused = false;
+#endif
 
     bool isWindowFocusedAndMenuOpen = isWindowFocused && VRManager::instance().XR->m_isMenuOpen;
     if (isWindowFocusedAndMenuOpen && GetSettings().IsDebuggingToolsEnabled()) {

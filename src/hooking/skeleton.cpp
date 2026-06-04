@@ -155,7 +155,8 @@ public:
         glm::vec3 ortho = glm::normalize(glm::cross(planeNormal, dirNorm));
 
         // arm 1 direction (world)
-        glm::vec3 arm1Dir = glm::normalize(dirNorm * cos(alpha) + ortho * sin(alpha));
+        // glm vec * float is fine; glm vec * double trips overload resolution on Linux.
+        glm::vec3 arm1Dir = glm::normalize(dirNorm * static_cast<float>(cos(alpha)) + ortho * static_cast<float>(sin(alpha)));
 
         // arm 2 direction (world)
         glm::vec3 elbowPos = rootPos + arm1Dir * l1;

@@ -9,6 +9,7 @@ static XrBool32 XR_DebugUtilsMessengerCallback(XrDebugUtilsMessageSeverityFlagsE
 }
 
 OpenXR::OpenXR() {
+    Log::print<INFO>("[BVR-trace] OpenXR ctor: enter");
     uint32_t xrExtensionCount = 0;
     xrEnumerateInstanceExtensionProperties(NULL, 0, &xrExtensionCount, NULL);
     std::vector<XrExtensionProperties> instanceExtensions;
@@ -28,13 +29,13 @@ OpenXR::OpenXR() {
     bool debugUtilsSupported = false;
     for (XrExtensionProperties& extensionProperties : instanceExtensions) {
         Log::print<VERBOSE>("Found available OpenXR extension: {}", extensionProperties.extensionName);
-        if (strcmp(extensionProperties.extensionName, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0) {
+        if (strcmp(extensionProperties.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
             d3d12Supported = true;
         }
         if (strcmp(extensionProperties.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0) {
             depthSupported = true;
         }
-        else if (strcmp(extensionProperties.extensionName, XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME) == 0) {
+        else if (strcmp(extensionProperties.extensionName, "XR_KHR_disabled_linux") == 0) {
             timeConvSupported = true;
         }
         else if (strcmp(extensionProperties.extensionName, XR_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
@@ -59,8 +60,9 @@ OpenXR::OpenXR() {
         Log::print<INFO>("OpenXR runtime doesn't support debug utils (XR_EXT_DEBUG_UTILS)! Errors/debug information will no longer be able to be shown!");
     }
 
-    std::vector<const char*> enabledExtensions = { XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME };
+    std::vector<const char*> enabledExtensions = { XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME };
     if (debugUtilsSupported) enabledExtensions.emplace_back(XR_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    Log::print<INFO>("[BVR-trace] before xrCreateInstance");
 
     XrInstanceCreateInfo xrInstanceCreateInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
     xrInstanceCreateInfo.createFlags = 0;
@@ -86,11 +88,10 @@ OpenXR::OpenXR() {
     }
 
     // Load extension pointers for this XrInstance
-    xrGetInstanceProcAddr(m_instance, "xrGetD3D12GraphicsRequirementsKHR", (PFN_xrVoidFunction*)&func_xrGetD3D12GraphicsRequirementsKHR);
-    if (timeConvSupported) {
-        xrGetInstanceProcAddr(m_instance, "xrConvertTimeToWin32PerformanceCounterKHR", (PFN_xrVoidFunction*)&func_xrConvertTimeToWin32PerformanceCounterKHR);
-        xrGetInstanceProcAddr(m_instance, "xrConvertWin32PerformanceCounterToTimeKHR", (PFN_xrVoidFunction*)&func_xrConvertWin32PerformanceCounterToTimeKHR);
-    }
+    xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsRequirements2KHR", (PFN_xrVoidFunction*)&func_xrGetVulkanGraphicsRequirements2KHR);
+    // (Win32 perf-counter time conversion not used on Linux — XrTime is in
+    // nanoseconds and our timing uses CLOCK_MONOTONIC throughout.)
+    (void)timeConvSupported;
     if (debugUtilsSupported) {
         xrGetInstanceProcAddr(m_instance, "xrCreateDebugUtilsMessengerEXT", (PFN_xrVoidFunction*)&func_xrCreateDebugUtilsMessengerEXT);
         xrGetInstanceProcAddr(m_instance, "xrDestroyDebugUtilsMessengerEXT", (PFN_xrVoidFunction*)&func_xrDestroyDebugUtilsMessengerEXT);
@@ -106,12 +107,15 @@ OpenXR::OpenXR() {
     }
 
     // Get system information
+    Log::print<INFO>("[BVR-trace] before xrGetSystem");
     XrSystemGetInfo xrSystemGetInfo = { XR_TYPE_SYSTEM_GET_INFO };
     xrSystemGetInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     checkXRResult(xrGetSystem(m_instance, &xrSystemGetInfo, &m_systemId), "No (available) head mounted display found!");
+    Log::print<INFO>("[BVR-trace] after xrGetSystem -> systemId=0x{:x}", (uint64_t)m_systemId);
 
     XrSystemProperties xrSystemProperties = { XR_TYPE_SYSTEM_PROPERTIES };
     checkXRResult(xrGetSystemProperties(m_instance, m_systemId, &xrSystemProperties), "Couldn't get system properties of the given VR headset!");
+    Log::print<INFO>("[BVR-trace] after xrGetSystemProperties");
     m_capabilities.supportsOrientational = xrSystemProperties.trackingProperties.orientationTracking;
     m_capabilities.supportsPositional = xrSystemProperties.trackingProperties.positionTracking;
 
@@ -122,10 +126,14 @@ OpenXR::OpenXR() {
     checkXRResult(xrGetViewConfigurationProperties(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, &stereoViewConfiguration), "There's no VR headset available that allows stereo rendering!");
     m_capabilities.supportsMutatableFOV = stereoViewConfiguration.fovMutable;
 
-    XrGraphicsRequirementsD3D12KHR graphicsRequirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR };
-    checkXRResult(func_xrGetD3D12GraphicsRequirementsKHR(m_instance, m_systemId, &graphicsRequirements), "Couldn't get D3D12 requirements for the given VR headset!");
-    m_capabilities.adapter = graphicsRequirements.adapterLuid;
-    m_capabilities.minFeatureLevel = graphicsRequirements.minFeatureLevel;
+    XrGraphicsRequirementsVulkan2KHR graphicsRequirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR };
+    checkXRResult(func_xrGetVulkanGraphicsRequirements2KHR(m_instance, m_systemId, &graphicsRequirements), "Couldn't get Vulkan2 requirements for the given VR headset!");
+    // adapterLuid / minFeatureLevel are D3D12-specific fields that the
+    // Vulkan2 graphics-requirements struct doesn't carry. On Linux the
+    // composer picks the physical device via xrGetVulkanGraphicsDevice2KHR
+    // (which gives us the VkPhysicalDevice directly), so the LUID is unused.
+    m_capabilities.adapter = LUID{};
+    m_capabilities.minFeatureLevel = D3D_FEATURE_LEVEL_12_0;
 
     // Print configuration used, mostly for debugging purposes
     Log::print<INFO>("Acquired system to be used:");
@@ -135,7 +143,10 @@ OpenXR::OpenXR() {
     Log::print<INFO>(" - Supports Mutable FOV: {}", m_capabilities.supportsMutatableFOV ? "Yes" : "No");
     Log::print<INFO>(" - Supports Orientation Tracking: {}", xrSystemProperties.trackingProperties.orientationTracking ? "Yes" : "No");
     Log::print<INFO>(" - Supports Positional Tracking: {}", xrSystemProperties.trackingProperties.positionTracking ? "Yes" : "No");
-    Log::print<INFO>(" - Supports D3D12 feature level {} or higher", graphicsRequirements.minFeatureLevel);
+    Log::print<INFO>(" - Vulkan min API version: {}.{}.{}",
+        XR_VERSION_MAJOR(graphicsRequirements.minApiVersionSupported),
+        XR_VERSION_MINOR(graphicsRequirements.minApiVersionSupported),
+        XR_VERSION_PATCH(graphicsRequirements.minApiVersionSupported));
 
     m_capabilities.isOculusLinkRuntime = std::string(properties.runtimeName) == "Oculus";
     Log::print<INFO>(" - Using Meta Quest Link OpenXR runtime: {}", m_capabilities.isOculusLinkRuntime ? "Yes" : "No");
@@ -208,7 +219,7 @@ std::array<XrViewConfigurationView, 2> OpenXR::GetViewConfigurations() {
     return xrViewConf;
 }
 
-void OpenXR::CreateSession(const XrGraphicsBindingD3D12KHR& d3d12Binding) {
+void OpenXR::CreateSession(const XrGraphicsBindingVulkan2KHR& d3d12Binding) {
     Log::print<INFO>("Creating the OpenXR session...");
 
     XrSessionCreateInfo sessionCreateInfo = { XR_TYPE_SESSION_CREATE_INFO };
@@ -779,7 +790,7 @@ void OpenXR::ProcessEvents() {
                 Log::print<VERBOSE>("OpenXR has indicated that the session is idle!");
                 break;
             case XR_SESSION_STATE_READY: {
-                Log::print<VERBOSE>("OpenXR has indicated that the session is ready!");
+                Log::print<INFO>("[BVR-trace] XR state -> READY (creating RND_Renderer + xrBeginSession)");
                 if (m_renderer) {
                     Log::print<WARNING>("OpenXR has indicated that the session is ready, but we already have a renderer!");
                 }
@@ -789,13 +800,13 @@ void OpenXR::ProcessEvents() {
                 break;
             }
             case XR_SESSION_STATE_SYNCHRONIZED:
-                Log::print<VERBOSE>("OpenXR has indicated that the session is synchronized!");
+                Log::print<INFO>("[BVR-trace] XR state -> SYNCHRONIZED");
                 break;
             case XR_SESSION_STATE_FOCUSED:
-                Log::print<VERBOSE>("OpenXR has indicated that the session is focused!");
+                Log::print<INFO>("[BVR-trace] XR state -> FOCUSED");
                 break;
             case XR_SESSION_STATE_VISIBLE:
-                Log::print<VERBOSE>("OpenXR has indicated that the session should be visible!");
+                Log::print<INFO>("[BVR-trace] XR state -> VISIBLE");
                 break;
             case XR_SESSION_STATE_STOPPING:
                 Log::print<VERBOSE>("OpenXR has indicated that the session should be ended!");

@@ -8,64 +8,107 @@
 #include <ranges>
 #include <set>
 #include <unordered_set>
+#include <map>
+#include <unordered_map>
 #include <queue>
 #include <iostream>
 #include <vector>
 #include <algorithm>
 #include <thread>
 #include <cstring>
-#include <thread>
 #include <chrono>
-#include <algorithm>
 #include <cctype>
+#include <utility>
+#include <format>
+#include <span>
+#include <array>
+#include <optional>
+#include <memory>
+#include <mutex>
 
-#include <Windows.h>
-#include <winrt/base.h>
-#include <shellapi.h>
+#if defined(_WIN32) && BETTERVR_HAS_WIN32
+    // ============================== Windows ============================== //
+    #include <Windows.h>
+    #include <winrt/base.h>
+    #include <shellapi.h>
 
+    // These macros mess with some of Vulkan's functions
+    #undef ERROR
+    #undef CreateEvent
+    #undef CreateSemaphore
 
-// These macros mess with some of Vulkan's functions
-#undef ERROR
-#undef CreateEvent
-#undef CreateSemaphore
+    #define VK_USE_PLATFORM_WIN32_KHR
+    #define VK_NO_PROTOTYPES
+    #include <vulkan/vk_layer.h>
+    #include <vulkan/vulkan_core.h>
 
-#define VK_USE_PLATFORM_WIN32_KHR
-#define VK_NO_PROTOTYPES
-#include <vulkan/vk_layer.h>
-#include <vulkan/vulkan_core.h>
+    #define VKROOTS_NEGOTIATION_INTERFACE VRLayer_NegotiateLoaderLayerInterfaceVersion
+    #include "vkroots.h"
 
-// vkroots vulkan layer framework includes
-#define VKROOTS_NEGOTIATION_INTERFACE VRLayer_NegotiateLoaderLayerInterfaceVersion
-#include "vkroots.h"
+    #include <d3d12.h>
+    #include <D3Dcompiler.h>
+    #include <dxgi1_6.h>
+    #pragma comment(lib, "d3d12.lib")
+    #pragma comment(lib, "dxgi.lib")
+    #pragma comment(lib, "D3DCompiler.lib")
+    #pragma comment(lib, "dxguid.lib")
+    #include <wrl/client.h>
+    using Microsoft::WRL::ComPtr;
 
-// D3D12 includes
-#include <d3d12.h>
-#include <D3Dcompiler.h>
-#include <dxgi1_6.h>
+    #define XR_USE_PLATFORM_WIN32
+    #define XR_USE_GRAPHICS_API_D3D12
+    #include <openxr/openxr.h>
+    #include <openxr/openxr_platform.h>
+#else
+    // ================================ Linux ================================ //
+    // Win32 type aliases + helpers (HANDLE, BOOL, MessageBox no-op, ComPtr stub)
+    #include "win32_compat_linux.h"
+    using Microsoft::WRL::ComPtr;
 
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "D3DCompiler.lib")
-#pragma comment(lib, "dxguid.lib")
+    // Vulkan loader layer headers. On Linux the composer-side stack (its
+    // own VkInstance + VkDevice, not interception) needs to call vkXxx
+    // functions by their loader names, so we leave VK_NO_PROTOTYPES off
+    // and link against libvulkan. Cemu-side hooks still go via vkroots'
+    // dispatch tables, which is purely a function-pointer-call style.
+    #include <vulkan/vk_layer.h>
+    #include <vulkan/vulkan_core.h>
 
-#include <wrl/client.h>
+    // vkroots: layer framework. Vendored in dependencies/.
+    #define VKROOTS_NEGOTIATION_INTERFACE VRLayer_NegotiateLoaderLayerInterfaceVersion
+    #include "vkroots.h"
 
-using Microsoft::WRL::ComPtr;
+    // OpenXR with Vulkan binding (V2 — required for WiVRn per prior testing).
+    #define XR_USE_GRAPHICS_API_VULKAN
+    #include <openxr/openxr.h>
+    #include <openxr/openxr_platform.h>
 
-// OpenXR includes
-#define XR_USE_PLATFORM_WIN32
-#define XR_USE_GRAPHICS_API_D3D12
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
+    // dlsym/dlopen — used to find Cemu's exported HLE registration helpers.
+    #include <dlfcn.h>
+#endif
 
-// ImGui includes
+// ImGui — vendored from dependencies/imgui. The Vulkan backend is built for
+// both Windows and Linux (with NO_PROTOTYPES on Windows, prototypes on Linux).
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
-#include <implot.h>
-#include <imgui_memory_editor.h>
+#if defined(_WIN32) && BETTERVR_HAS_WIN32
+    #include <implot.h>
+    #include <imgui_memory_editor.h>
+#else
+    // ImPlot is optional on Linux until the imgui_menus port is finished —
+    // gate its uses with BETTERVR_HAS_IMPLOT in that file.
+    #if __has_include(<implot.h>)
+        #include <implot.h>
+        #define BETTERVR_HAS_IMPLOT 1
+    #else
+        #define BETTERVR_HAS_IMPLOT 0
+    #endif
+    #if __has_include(<imgui_memory_editor.h>)
+        #include <imgui_memory_editor.h>
+    #endif
+#endif
 
-// glm includes
+// glm
 #define GLM_FORCE_XYZW_ONLY
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -74,11 +117,21 @@ using Microsoft::WRL::ComPtr;
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+// On Linux we set GLM_ENABLE_EXPERIMENTAL globally via add_compile_definitions
+// in CMake (multiple headers include glm/gtx/* after pch.h, so a local
+// undef would re-break them). The #ifndef gate covers both Windows (define
+// here, undef after) and Linux (already defined globally — skip define+undef).
+#ifndef GLM_ENABLE_EXPERIMENTAL
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/norm.hpp>
 #include <glm/gtx/string_cast.hpp>
 #include <glm/gtx/euler_angles.hpp>
 #undef GLM_ENABLE_EXPERIMENTAL
+#else
+#include <glm/gtx/norm.hpp>
+#include <glm/gtx/string_cast.hpp>
+#include <glm/gtx/euler_angles.hpp>
+#endif
 
 #define ENABLE_VK_ROBUSTNESS 0
 
@@ -136,14 +189,26 @@ inline uint32_t stringToHash(const char* str) {
     return hash;
 }
 
+#if defined(_WIN32) && BETTERVR_HAS_WIN32
 inline std::string wcharToUtf8(const wchar_t* wstr) {
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
     std::string str(size_needed, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &str[0], size_needed, nullptr, nullptr);
     return str;
 }
+#else
+inline std::string wcharToUtf8(const wchar_t* wstr) {
+    if (!wstr) return {};
+    std::string out;
+    for (const wchar_t* p = wstr; *p; ++p) out.push_back(static_cast<char>(*p & 0xFF));
+    return out;
+}
+#endif
 
-#define PADDED_BYTES(from, up) uint8_t byte_##from##[ ## (up-from+0x04) ## ]
+// Linux clang doesn't accept MSVC's "## [ ##" token-pasting trick; the legal
+// form just concatenates `byte_` with `from` and uses the bracket as plain
+// punctuation. Behavior is the same: a zero-padded-bytes filler array.
+#define PADDED_BYTES(from, up) uint8_t byte_##from[((up) - (from) + 0x04)]
 
 template<class T, template<class...> class U>
 inline constexpr bool is_instance_of_v = std::false_type{};
@@ -169,35 +234,26 @@ using enable_if_bitmask_t = std::enable_if_t<is_bitmask_enum<T>::value, T>;
     template <>                     \
     struct is_bitmask_enum<x> : std::true_type {};
 
-// Bitwise OR
 template <typename T>
 constexpr enable_if_bitmask_t<T> operator|(T lhs, T rhs) {
     using U = std::underlying_type_t<T>;
     return static_cast<T>(static_cast<U>(lhs) | static_cast<U>(rhs));
 }
-
-// Bitwise AND
 template <typename T>
 constexpr enable_if_bitmask_t<T> operator&(T lhs, T rhs) {
     using U = std::underlying_type_t<T>;
     return static_cast<T>(static_cast<U>(lhs) & static_cast<U>(rhs));
 }
-
-// Bitwise XOR
 template <typename T>
 constexpr enable_if_bitmask_t<T> operator^(T lhs, T rhs) {
     using U = std::underlying_type_t<T>;
     return static_cast<T>(static_cast<U>(lhs) ^ static_cast<U>(rhs));
 }
-
-// Bitwise NOT
 template <typename T>
 constexpr enable_if_bitmask_t<T> operator~(T val) {
     using U = std::underlying_type_t<T>;
     return static_cast<T>(~static_cast<U>(val));
 }
-
-// Assignment OR
 template <typename T>
 constexpr enable_if_bitmask_t<T>& operator|=(T& lhs, T rhs) {
     lhs = lhs | rhs;
@@ -251,11 +307,16 @@ inline T swapEndianness(T val) {
     }
 }
 
-struct BETypeCompatible {
-};
+// BETypeCompatible — Windows MSVC under #pragma pack(1) used EBO to collapse
+// this empty base to 0 bytes. Linux clang does *not* — each empty base still
+// occupies at least 1 byte, breaking every Wii-U struct layout. The fix is to
+// drop the inheritance and tag the BE types via a typedef instead. The
+// `is_BEType_v` test below uses SFINAE on that typedef.
+struct BETypeCompatibleTag {};
 
 template<typename T>
-struct BEType : BETypeCompatible {
+struct BEType {
+    using is_be_type = BETypeCompatibleTag;
     T val;
 
     BEType() = default;
@@ -311,10 +372,16 @@ struct BEType : BETypeCompatible {
 };
 
 
+// SFINAE detector: a type is a BE-type if it exposes the `is_be_type` typedef.
+template <typename T, typename = void>
+struct is_BEType : std::false_type {};
+template <typename T>
+struct is_BEType<T, std::void_t<typename T::is_be_type>> : std::true_type {};
 template<typename T>
-inline constexpr bool is_BEType_v = std::is_base_of_v<BETypeCompatible, T>;
+inline constexpr bool is_BEType_v = is_BEType<T>::value;
 
-struct BEVec2 : BETypeCompatible {
+struct BEVec2 {
+    using is_be_type = BETypeCompatibleTag;
     BEType<float> x;
     BEType<float> y;
 
@@ -327,7 +394,8 @@ struct BEVec2 : BETypeCompatible {
     }
 };
 
-struct BEVec3 : BETypeCompatible {
+struct BEVec3 {
+    using is_be_type = BETypeCompatibleTag;
     BEType<float> x;
     BEType<float> y;
     BEType<float> z;
@@ -355,7 +423,8 @@ struct BEVec3 : BETypeCompatible {
     }
 };
 
-struct BEMatrix34 : BETypeCompatible {
+struct BEMatrix34 {
+    using is_be_type = BETypeCompatibleTag;
     BEType<float> x_x;
     BEType<float> y_x;
     BEType<float> z_x;
@@ -392,28 +461,18 @@ struct BEMatrix34 : BETypeCompatible {
 
     glm::mat4x3 getLEMatrix() const {
         return glm::mat4x3(
-            glm::vec3(x_x.getLE(), x_y.getLE(), x_z.getLE()),      // X basis column
-            glm::vec3(y_x.getLE(), y_y.getLE(), y_z.getLE()),      // Y basis column
-            glm::vec3(z_x.getLE(), z_y.getLE(), z_z.getLE()),      // Z basis column
-            glm::vec3(pos_x.getLE(), pos_y.getLE(), pos_z.getLE()) // translation column
+            glm::vec3(x_x.getLE(), x_y.getLE(), x_z.getLE()),
+            glm::vec3(y_x.getLE(), y_y.getLE(), y_z.getLE()),
+            glm::vec3(z_x.getLE(), z_y.getLE(), z_z.getLE()),
+            glm::vec3(pos_x.getLE(), pos_y.getLE(), pos_z.getLE())
         );
     }
 
     void setLEMatrix(const glm::mat4x3& m) {
-        // m[col][row]
-        x_x = m[0][0];
-        x_y = m[0][1];
-        x_z = m[0][2];
-        y_x = m[1][0];
-        y_y = m[1][1];
-        y_z = m[1][2];
-        z_x = m[2][0];
-        z_y = m[2][1];
-        z_z = m[2][2];
-
-        pos_x = m[3][0];
-        pos_y = m[3][1];
-        pos_z = m[3][2];
+        x_x = m[0][0]; x_y = m[0][1]; x_z = m[0][2];
+        y_x = m[1][0]; y_y = m[1][1]; y_z = m[1][2];
+        z_x = m[2][0]; z_y = m[2][1]; z_z = m[2][2];
+        pos_x = m[3][0]; pos_y = m[3][1]; pos_z = m[3][2];
     }
 
     BEVec3 getPos() const {
@@ -421,47 +480,28 @@ struct BEMatrix34 : BETypeCompatible {
     }
 
     void setPos(glm::fvec3 pos) {
-        pos_x = pos.x;
-        pos_y = pos.y;
-        pos_z = pos.z;
+        pos_x = pos.x; pos_y = pos.y; pos_z = pos.z;
     }
 
     glm::fquat getRotLE() const {
         return glm::quat_cast(glm::fmat3(getLEMatrix()));
     }
 
-	void setRotLE(const glm::fquat& rotation) {
+    void setRotLE(const glm::fquat& rotation) {
         glm::fmat3 rotMat = glm::mat3_cast(rotation);
 
-        x_x = rotMat[0][0];
-        y_x = rotMat[1][0];
-        z_x = rotMat[2][0];
-        x_y = rotMat[0][1];
-        y_y = rotMat[1][1];
-        z_y = rotMat[2][1];
-        x_z = rotMat[0][2];
-        y_z = rotMat[1][2];
-        z_z = rotMat[2][2];
+        x_x = rotMat[0][0]; y_x = rotMat[1][0]; z_x = rotMat[2][0];
+        x_y = rotMat[0][1]; y_y = rotMat[1][1]; z_y = rotMat[2][1];
+        x_z = rotMat[0][2]; y_z = rotMat[1][2]; z_z = rotMat[2][2];
     }
 };
 
-struct BEMatrix44 : BETypeCompatible {
-    BEType<float> a00;
-    BEType<float> a01;
-    BEType<float> a02;
-    BEType<float> a03;
-    BEType<float> a10;
-    BEType<float> a11;
-    BEType<float> a12;
-    BEType<float> a13;
-    BEType<float> a20;
-    BEType<float> a21;
-    BEType<float> a22;
-    BEType<float> a23;
-    BEType<float> a30;
-    BEType<float> a31;
-    BEType<float> a32;
-    BEType<float> a33;
+struct BEMatrix44 {
+    using is_be_type = BETypeCompatibleTag;
+    BEType<float> a00; BEType<float> a01; BEType<float> a02; BEType<float> a03;
+    BEType<float> a10; BEType<float> a11; BEType<float> a12; BEType<float> a13;
+    BEType<float> a20; BEType<float> a21; BEType<float> a22; BEType<float> a23;
+    BEType<float> a30; BEType<float> a31; BEType<float> a32; BEType<float> a33;
 
     BEMatrix44() = default;
 
@@ -475,22 +515,10 @@ struct BEMatrix44 : BETypeCompatible {
     }
 
     void operator=(glm::fmat4 mtx) {
-        a00 = mtx[0][0];
-        a01 = mtx[0][1];
-        a02 = mtx[0][2];
-        a03 = mtx[0][3];
-        a10 = mtx[1][0];
-        a11 = mtx[1][1];
-        a12 = mtx[1][2];
-        a13 = mtx[1][3];
-        a20 = mtx[2][0];
-        a21 = mtx[2][1];
-        a22 = mtx[2][2];
-        a23 = mtx[2][3];
-        a30 = mtx[3][0];
-        a31 = mtx[3][1];
-        a32 = mtx[3][2];
-        a33 = mtx[3][3];
+        a00 = mtx[0][0]; a01 = mtx[0][1]; a02 = mtx[0][2]; a03 = mtx[0][3];
+        a10 = mtx[1][0]; a11 = mtx[1][1]; a12 = mtx[1][2]; a13 = mtx[1][3];
+        a20 = mtx[2][0]; a21 = mtx[2][1]; a22 = mtx[2][2]; a23 = mtx[2][3];
+        a30 = mtx[3][0]; a31 = mtx[3][1]; a32 = mtx[3][2]; a33 = mtx[3][3];
     }
 };
 

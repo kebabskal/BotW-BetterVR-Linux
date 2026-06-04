@@ -1,7 +1,7 @@
 #pragma once
 
 #include "pch.h"
-#include "d3d12.h"
+#include "vk_composer.h"
 #include "openxr.h"
 #include "swapchain.h"
 #include "texture.h"
@@ -133,14 +133,14 @@ public:
         auto& GetDepthSharedTextures() { return m_depthTextures; }
 
     private:
-        std::array<std::unique_ptr<Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>>, 2> m_swapchains;
-        std::array<std::unique_ptr<Swapchain<DXGI_FORMAT_D32_FLOAT>>, 2> m_depthSwapchains;
-        std::array<std::unique_ptr<RND_D3D12::PresentPipeline<true>>, 2> m_presentPipelines;
+        std::array<std::unique_ptr<Swapchain<VK_FORMAT_R8G8B8A8_SRGB>>, 2> m_swapchains;
+        std::array<std::unique_ptr<Swapchain<VK_FORMAT_D32_SFLOAT>>, 2> m_depthSwapchains;
+        std::array<std::unique_ptr<RND_VkComposer::PresentPipeline<true>>, 2> m_presentPipelines;
         std::array<std::array<std::unique_ptr<SharedTexture>, 2>, 2> m_textures;
         std::array<std::array<std::unique_ptr<SharedTexture>, 2>, 2> m_depthTextures;
         std::array<float, 2> m_recommendedAspectRatios = { 1.0f, 1.0f };
         std::array<RenderUtils::UvTransform, 2> m_presentUvTransforms = {};
-        std::unique_ptr<RND_D3D12::DebugDrawPipeline> m_debugDrawPipeline;
+        std::unique_ptr<RND_VkComposer::DebugDrawPipeline> m_debugDrawPipeline;
 
         std::array<XrCompositionLayerProjectionView, 2> m_projectionViews = {};
         std::array<XrCompositionLayerDepthInfoKHR, 2> m_projectionViewsDepthInfo = {};
@@ -171,8 +171,8 @@ public:
 
     private:
         static std::atomic_bool s_isBowAimingActive;
-        std::unique_ptr<Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>> m_swapchain;
-        std::unique_ptr<RND_D3D12::PresentPipeline<false>> m_presentPipeline;
+        std::unique_ptr<Swapchain<VK_FORMAT_R8G8B8A8_SRGB>> m_swapchain;
+        std::unique_ptr<RND_VkComposer::PresentPipeline<false>> m_presentPipeline;
         std::array<std::unique_ptr<SharedTexture>, 2> m_textures;
 
         glm::quat m_currentOrientation = glm::identity<glm::fquat>();

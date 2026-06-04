@@ -2,7 +2,10 @@
 
 #pragma pack(push, 1)
 namespace sead {
-    struct SafeString : BETypeCompatible {
+    // Same Linux EBO issue as in pch.h's BEType — drop the empty-base
+    // inheritance, use the SFINAE typedef tag instead.
+    struct SafeString {
+        using is_be_type = BETypeCompatibleTag;
         BEType<uint32_t> c_str;
         BEType<uint32_t> vtable;
     };

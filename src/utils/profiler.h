@@ -137,11 +137,9 @@ public:
             return;
         }
 
-        threadState.spans[threadState.count++] = {
-            .section = section,
-            .startNs = GetTimestampNs(),
-            .generation = generation,
-        };
+        // Was designated-init aggregate assignment; the explicit ctor we added
+        // for Linux compatibility makes this non-aggregate, so call the ctor.
+        threadState.spans[threadState.count++] = ActiveSpan(section, GetTimestampNs(), generation);
     }
 
     static void EndSpan(Section section) {
@@ -250,35 +248,50 @@ public:
     }
 
 private:
+    // Linux clang requires that nested types referenced by `inline static`
+    // members of the enclosing class not use default member initializers; add
+    // explicit constructors so the static members can value-init them.
     struct ActiveSpan {
-        Section section = Section::RoomscaleResolve;
-        uint64_t startNs = 0;
-        uint32_t generation = 0;
+        Section section;
+        uint64_t startNs;
+        uint32_t generation;
+        ActiveSpan() : section(Section::RoomscaleResolve), startNs(0), generation(0) {}
+        ActiveSpan(Section s, uint64_t ns, uint32_t g) : section(s), startNs(ns), generation(g) {}
     };
 
     struct ThreadSpanState {
-        std::array<ActiveSpan, 64> spans = {};
-        size_t count = 0;
-        uint32_t generation = 0;
+        std::array<ActiveSpan, 64> spans;
+        size_t count;
+        uint32_t generation;
+        ThreadSpanState() : spans{}, count(0), generation(0) {}
     };
 
     struct SectionState {
-        std::atomic<uint64_t> pendingFrameTotalNs = 0;
-        std::atomic<uint32_t> pendingFrameCalls = 0;
-        std::atomic<uint64_t> lastFrameTotalNs = 0;
-        std::atomic<uint64_t> averageFrameTotalNs = 0;
-        std::atomic<uint64_t> maxFrameTotalNs = 0;
-        std::atomic<uint32_t> lastFrameCalls = 0;
-        std::atomic<uint32_t> averageFrameSamples = 0;
-        std::atomic<uint64_t> lastCallNs = 0;
-        std::atomic<uint64_t> maxCallNs = 0;
-        std::atomic<uint64_t> activeSpanStartNs = 0;
+        std::atomic<uint64_t> pendingFrameTotalNs;
+        std::atomic<uint32_t> pendingFrameCalls;
+        std::atomic<uint64_t> lastFrameTotalNs;
+        std::atomic<uint64_t> averageFrameTotalNs;
+        std::atomic<uint64_t> maxFrameTotalNs;
+        std::atomic<uint32_t> lastFrameCalls;
+        std::atomic<uint32_t> averageFrameSamples;
+        std::atomic<uint64_t> lastCallNs;
+        std::atomic<uint64_t> maxCallNs;
+        std::atomic<uint64_t> activeSpanStartNs;
+        SectionState()
+            : pendingFrameTotalNs(0), pendingFrameCalls(0), lastFrameTotalNs(0),
+              averageFrameTotalNs(0), maxFrameTotalNs(0), lastFrameCalls(0),
+              averageFrameSamples(0), lastCallNs(0), maxCallNs(0),
+              activeSpanStartNs(0) {}
     };
 
     inline static std::atomic_bool s_enabled = false;
     inline static std::atomic_uint32_t s_spanGeneration = 1;
-    inline static std::array<SectionState, kSectionCount> s_states = {};
-    inline static thread_local ThreadSpanState s_threadSpanState = {};
+    // No "= {}" here: under Linux clang the explicit aggregate init from
+    // inside the class definition tries to invoke the inner default member
+    // initializers before they're complete, which is rejected. Default
+    // value-init of atomics gives the same effect.
+    inline static std::array<SectionState, kSectionCount> s_states;
+    inline static thread_local ThreadSpanState s_threadSpanState;
     inline static constexpr std::array<const char*, kSectionCount> s_sectionNames = {
         "Roomscale Resolve",
         "Roomscale Begin",

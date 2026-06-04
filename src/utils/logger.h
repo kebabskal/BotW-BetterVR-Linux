@@ -243,7 +243,7 @@ public:
     Log();
     ~Log();
 
-    template <typename LogType L>
+    template <LogType L>
     static inline bool consteval isLogTypeEnabled() {
         if constexpr (L == ERROR) {
             return true;
@@ -271,7 +271,7 @@ public:
         return false;
     }
 
-    template <typename LogType L>
+    template <LogType L>
     static inline void print(const char* message) {
         if constexpr (!isLogTypeEnabled<L>()) {
             return;
@@ -298,7 +298,7 @@ public:
 #endif
     }
 
-    template <typename LogType L, class... Args>
+    template <LogType L, class... Args>
     static inline void print(const char* format, Args&&... args) {
         if constexpr (!isLogTypeEnabled<L>()) {
             return;

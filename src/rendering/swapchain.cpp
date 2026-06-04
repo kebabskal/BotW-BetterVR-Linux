@@ -1,81 +1,120 @@
+#include "pch.h"
+
 #include "swapchain.h"
-#include "utils/d3d12_utils.h"
 #include "instance.h"
+#include "utils/vulkan_utils.h"
 
-template <DXGI_FORMAT T>
-Swapchain<T>::Swapchain(uint32_t width, uint32_t height, uint32_t sampleCount): m_width(width), m_height(height) {
-    auto getBestSwapchainFormat = [](const std::vector<DXGI_FORMAT>& applicationSupportedFormats) -> DXGI_FORMAT {
-        // Finds the first matching DXGI_FORMAT (int) that matches the int64 from OpenXR
-        uint32_t swapchainCount = 0;
-        xrEnumerateSwapchainFormats(VRManager::instance().XR->GetSession(), 0, &swapchainCount, nullptr);
-        std::vector<int64_t> xrPreferredFormats(swapchainCount);
-        xrEnumerateSwapchainFormats(VRManager::instance().XR->GetSession(), swapchainCount, &swapchainCount, xrPreferredFormats.data());
+// Templated VR swapchain. Mirrors upstream d3d12 version's lifecycle:
+//   ctor → xrCreateSwapchain + enumerate VkImage[] + create VkImageView per
+//   PrepareRendering → no-op (D3D12 used this for sync; we don't need it)
+//   StartRendering    → xrAcquireSwapchainImage + xrWaitSwapchainImage
+//   FinishRendering   → xrReleaseSwapchainImage
 
-        auto found = std::ranges::find_first_of(xrPreferredFormats, applicationSupportedFormats);
-        if (found == xrPreferredFormats.end()) {
-            throw std::runtime_error("OpenXR runtime doesn't support any of the presenting modes that the OpenXR drivers support.");
-        }
-        return (DXGI_FORMAT)*found;
-    };
-
-    const std::vector<DXGI_FORMAT> preferredColorFormats = {
-        // fixme: check if OpenXR prefers sRGB or not
-        T
-    };
-    m_format = getBestSwapchainFormat(preferredColorFormats);
-
-    XrSwapchainCreateInfo swapchainCreateInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-    swapchainCreateInfo.width = width;
-    swapchainCreateInfo.height = height;
-    swapchainCreateInfo.arraySize = 1;
-    swapchainCreateInfo.sampleCount = sampleCount;
-    swapchainCreateInfo.format = m_format;
-    swapchainCreateInfo.mipCount = 1;
-    swapchainCreateInfo.faceCount = 1;
-    swapchainCreateInfo.usageFlags = (D3D12Utils::IsDepthFormat(T) ? XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    swapchainCreateInfo.createFlags = 0;
-    checkXRResult(xrCreateSwapchain(VRManager::instance().XR->GetSession(), &swapchainCreateInfo, &m_swapchain), "Failed to create OpenXR swapchain images!");
-
-    uint32_t swapchainImagesCount = 0;
-    checkXRResult(xrEnumerateSwapchainImages(m_swapchain, 0, &swapchainImagesCount, NULL), "Failed to enumerate swapchain images!");
-    std::vector<XrSwapchainImageD3D12KHR> swapchainImages(swapchainImagesCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
-    checkXRResult(xrEnumerateSwapchainImages(m_swapchain, swapchainImagesCount, &swapchainImagesCount, reinterpret_cast<XrSwapchainImageBaseHeader*>(swapchainImages.data())), "Failed to enumerate swapchain images!");
-
-    for (size_t i = 0; i < swapchainImages.size(); i++) {
-        // D3D12Utils::CreateConstantBuffer(D3D12_HEAP_TYPE_DEFAULT);
-        D3D12_SET_NAME(swapchainImages[i].texture, std::format(L"Swapchain Image {}", i).c_str());
-        m_swapchainTextures.emplace_back(swapchainImages[i].texture);
+namespace {
+    // Pull the requested format from the XR-side enumerated list. Quest 2 via
+    // WiVRn typically lists ~13 formats; if our preferred format isn't
+    // available, fall back to the runtime's first choice (recommended).
+    int64_t PickFormat(const std::vector<int64_t>& formats, VkFormat preferred) {
+        for (int64_t f : formats) if (f == (int64_t)preferred) return f;
+        return formats.empty() ? 0 : formats.front();
     }
 }
 
-template <DXGI_FORMAT T>
-void Swapchain<T>::PrepareRendering() {
-    checkXRResult(xrAcquireSwapchainImage(m_swapchain, NULL, &m_swapchainImageIdx), "Can't acquire OpenXR swapchain image!");
-}
+template <VkFormat T>
+Swapchain<T>::Swapchain(uint32_t width, uint32_t height, uint32_t sampleCount)
+    : m_width(width), m_height(height)
+{
+    XrSession session = VRManager::instance().XR->GetSession();
+    checkAssert(session != XR_NULL_HANDLE, "Swapchain ctor: no XR session yet");
 
-template <DXGI_FORMAT T>
-ID3D12Resource* Swapchain<T>::StartRendering() {
-    XrSwapchainImageWaitInfo waitSwapchainInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-    waitSwapchainInfo.timeout = XR_INFINITE_DURATION;
-    if (XrResult waitResult = xrWaitSwapchainImage(m_swapchain, &waitSwapchainInfo); waitResult == XR_TIMEOUT_EXPIRED || XR_FAILED(waitResult)) {
-        checkXRResult(waitResult, "Failed to wait for swapchain image!");
+    uint32_t formatCount = 0;
+    checkXRResult(xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr),
+                  "xrEnumerateSwapchainFormats count");
+    std::vector<int64_t> formats(formatCount);
+    checkXRResult(xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()),
+                  "xrEnumerateSwapchainFormats");
+    const int64_t chosen = PickFormat(formats, T);
+    m_format = static_cast<VkFormat>(chosen);
+
+    XrSwapchainCreateInfo sci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                     XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    if constexpr (T == VK_FORMAT_D32_SFLOAT || T == VK_FORMAT_D16_UNORM ||
+                  T == VK_FORMAT_D24_UNORM_S8_UINT || T == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        sci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                         XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     }
+    sci.format = chosen;
+    sci.sampleCount = sampleCount;
+    sci.width = width;
+    sci.height = height;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
 
-    return m_swapchainTextures[m_swapchainImageIdx].Get();
+    checkXRResult(xrCreateSwapchain(session, &sci, &m_swapchain), "xrCreateSwapchain");
+
+    uint32_t imageCount = 0;
+    checkXRResult(xrEnumerateSwapchainImages(m_swapchain, 0, &imageCount, nullptr),
+                  "xrEnumerateSwapchainImages count");
+    std::vector<XrSwapchainImageVulkan2KHR> xrImages(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR });
+    checkXRResult(xrEnumerateSwapchainImages(m_swapchain, imageCount, &imageCount,
+                                             reinterpret_cast<XrSwapchainImageBaseHeader*>(xrImages.data())),
+                  "xrEnumerateSwapchainImages");
+
+    m_swapchainImages.reserve(imageCount);
+    m_swapchainImageViews.reserve(imageCount);
+    VkDevice dev = VRManager::instance().Composer->GetDevice();
+    for (auto& xi : xrImages) {
+        m_swapchainImages.push_back(xi.image);
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = xi.image;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = m_format;
+        vci.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+        vci.subresourceRange.aspectMask = VulkanUtils::GetAspectMaskForFormat(m_format);
+        vci.subresourceRange.levelCount = 1;
+        vci.subresourceRange.layerCount = 1;
+        VkImageView view = VK_NULL_HANDLE;
+        checkVkResult(vkCreateImageView(dev, &vci, nullptr, &view), "xr swapchain image view");
+        m_swapchainImageViews.push_back(view);
+    }
 }
 
-template <DXGI_FORMAT T>
-void Swapchain<T>::FinishRendering() {
-    XrSwapchainImageReleaseInfo releaseSwapchainInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-    checkXRResult(xrReleaseSwapchainImage(m_swapchain, &releaseSwapchainInfo), "Failed to release swapchain image!");
-}
-
-template <DXGI_FORMAT T>
+template <VkFormat T>
 Swapchain<T>::~Swapchain() {
-    if (m_swapchain != XR_NULL_HANDLE) {
-        xrDestroySwapchain(m_swapchain);
+    VkDevice dev = VRManager::instance().Composer ? VRManager::instance().Composer->GetDevice() : VK_NULL_HANDLE;
+    if (dev) {
+        for (VkImageView v : m_swapchainImageViews) if (v) vkDestroyImageView(dev, v, nullptr);
     }
+    if (m_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(m_swapchain);
 }
 
-template class Swapchain<DXGI_FORMAT_D32_FLOAT>;
-template class Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>;
+template <VkFormat T>
+void Swapchain<T>::PrepareRendering() {
+    // D3D12 needed an explicit "prepare" step to advance fence values; Vulkan
+    // acquire+wait in StartRendering does the equivalent.
+}
+
+template <VkFormat T>
+VkImage Swapchain<T>::StartRendering() {
+    XrSwapchainImageAcquireInfo ai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    checkXRResult(xrAcquireSwapchainImage(m_swapchain, &ai, &m_swapchainImageIdx),
+                  "xrAcquireSwapchainImage");
+    XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wi.timeout = XR_INFINITE_DURATION;
+    checkXRResult(xrWaitSwapchainImage(m_swapchain, &wi), "xrWaitSwapchainImage");
+    return m_swapchainImages[m_swapchainImageIdx];
+}
+
+template <VkFormat T>
+void Swapchain<T>::FinishRendering() {
+    XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    checkXRResult(xrReleaseSwapchainImage(m_swapchain, &ri), "xrReleaseSwapchainImage");
+}
+
+// Explicit instantiations to match every Layer3D/Layer2D template usage.
+template class Swapchain<VK_FORMAT_R8G8B8A8_SRGB>;
+template class Swapchain<VK_FORMAT_D32_SFLOAT>;

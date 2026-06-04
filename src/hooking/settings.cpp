@@ -104,6 +104,7 @@ std::atomic_uint32_t CemuHooks::s_framesSinceLastCameraUpdate = 0;
 std::unordered_set<ScreenId> prevEnabledScreens = {};
 
 void CemuHooks::InitWindowHandles() {
+#if BETTERVR_HAS_WIN32
     // find HWND that starts with Cemu in its title
     struct EnumWindowsData {
         DWORD cemuPid;
@@ -128,16 +129,20 @@ void CemuHooks::InitWindowHandles() {
     (LPARAM)&enumData);
     m_cemuTopWindow = enumData.outHwnd;
 
-    // find the most nested child window since that's the rendering window
     HWND iteratedHwnd = m_cemuTopWindow;
     while (true) {
         HWND nextIteratedHwnd = FindWindowExW(iteratedHwnd, NULL, NULL, NULL);
-        if (nextIteratedHwnd == NULL) {
-            break;
-        }
+        if (nextIteratedHwnd == NULL) break;
         iteratedHwnd = nextIteratedHwnd;
     }
     m_cemuRenderWindow = iteratedHwnd;
+#else
+    // Linux: Wayland/X11 window discovery isn't applicable to the layer's
+    // rendering path. The render window handle is only used for desktop-side
+    // ImGui input routing, which is gated by HasFocus() anyway.
+    m_cemuTopWindow = nullptr;
+    m_cemuRenderWindow = nullptr;
+#endif
 }
 
 void CemuHooks::hook_UpdateSettings(PPCInterpreter_t* hCPU) {

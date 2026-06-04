@@ -504,6 +504,13 @@ std::array<bool, ImGuiKey_NamedKey_COUNT> s_pressedNamedKeyState = {};
 }
 
 void EntityDebugger::UpdateKeyboardControls() {
+#if !BETTERVR_HAS_WIN32
+    // Linux: ImGui receives keyboard events through its own platform backend
+    // (X11/Wayland) when Cemu's desktop window has focus. The debug-tools
+    // poll path below uses Win32's GetAsyncKeyState directly, which isn't
+    // worth porting for a debug-only feature.
+    return;
+#else
     // capture keyboard input
     ImGui::GetIO().KeyAlt = GetAsyncKeyState(VK_MENU) & 0x8000;
     ImGui::GetIO().KeyCtrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
@@ -568,4 +575,5 @@ void EntityDebugger::UpdateKeyboardControls() {
     else if (!isBackspaceKeyDown && wasBackspaceKeyDown) {
         ImGui::GetIO().AddKeyEvent(ImGuiKey_Backspace, false);
     }
+#endif // BETTERVR_HAS_WIN32
 }
